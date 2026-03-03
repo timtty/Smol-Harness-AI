@@ -8,5 +8,7 @@ typing_extensions
 shortuuid
 requests
 html2text
+beautifulsoup4
+sumy
 python-dotenv
 rich

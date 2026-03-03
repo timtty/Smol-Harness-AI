@@ -26,12 +26,17 @@ from subprocess import TimeoutExpired
 from requests import get as http_get
 from html2text import HTML2Text
 from xml.etree.ElementTree import fromstring as xml_parse
+from bs4 import BeautifulSoup
+import re
 
+import sys
 from dotenv import load_dotenv
 from os import environ as env
 from random import choice as random_choice
 from time import time
 from time import sleep
+from contextlib import contextmanager
+import threading
 
 from rich.console import Console
 from rich.markdown import Markdown
@@ -44,7 +49,7 @@ from rich import box
 
 console = Console()
 console.clear()
-status = console.status("Waking up...")
+status = console.status("Waking up...", spinner="aesthetic")
 
 load_dotenv()
 
@@ -52,7 +57,10 @@ import os as _os
 _os.makedirs(".cache", exist_ok=True)
 from langchain_community.cache import SQLiteCache
 from langchain_classic.globals import set_llm_cache
-set_llm_cache(SQLiteCache(database_path=".cache/llm.db"))
+
+# Skip LLM cache when FRESH_RUN=1 or --no-cache so the same prompt runs without cached responses
+if not env.get("FRESH_RUN") and "--no-cache" not in sys.argv:
+    set_llm_cache(SQLiteCache(database_path=".cache/llm.db"))
 
 PASTEL_COLORS = [
     "#FFB3BA", "#FFDFBA", "#FFFFBA", "#BAFFC9", "#BAE1FF",
@@ -64,6 +72,96 @@ def log(message: str) -> None:
     console.print(f"[{color}]●[/] {message}\n")
 
 MODEL = "qwen/qwen3-4b-2507"
+
+# Max chars of task result to send to validator (avoids context overflow from long webpages/files)
+VALIDATE_RESULT_MAX_CHARS = 24_000
+# Max chars per result when building context for summarize step (5 results × this = total cap)
+SUMMARIZE_RESULT_MAX_CHARS = 20_000
+# Max chars returned from read_webpage to avoid huge state and store
+READ_WEBPAGE_MAX_CHARS = 100_000
+# When cleaned text exceeds this, use sumy (TextRank) extractive summary instead of raw truncation
+SUMMY_SUMMARIZE_WHEN_OVER_CHARS = 25_000
+# Max sentences to keep when sumy summarization runs
+SUMMY_MAX_SENTENCES = 80
+
+# Elements to strip from HTML before conversion (noise, non-content)
+_STRIP_HTML_TAGS = (
+    "script", "style", "noscript", "iframe", "svg", "object", "embed",
+    "nav", "header", "footer", "aside", "form", "button", "input", "select", "textarea",
+)
+# Roles that usually wrap chrome, not main content
+_STRIP_HTML_ROLES = ("navigation", "banner", "contentinfo", "complementary", "search")
+
+
+def _strip_html_noise(html: str) -> str:
+    """Remove script, style, nav, and other typical noise before converting to text."""
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup.find_all(_STRIP_HTML_TAGS):
+        tag.decompose()
+    for el in soup.find_all(attrs={"role": lambda v: v and v in _STRIP_HTML_ROLES}):
+        el.decompose()
+    # Prefer main content if present and substantial
+    main = soup.find("main") or soup.find("article")
+    if main and len(main.get_text(strip=True)) > 200:
+        body = main
+    else:
+        body = soup.find("body") or soup
+    return str(body)
+
+
+def _clean_extracted_text(text: str) -> str:
+    """Collapse excessive whitespace and drop common UI-only lines."""
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    lines = []
+    skip_phrases = re.compile(
+        r"^(share|tweet|subscribe|newsletter|cookie|accept all|manage preferences|"
+        r"follow us|related articles|read more|advertisement|sponsored|\\|/|·)$",
+        re.I,
+    )
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or skip_phrases.match(line) or len(line) <= 2:
+            continue
+        lines.append(line)
+    return "\n\n".join(lines)
+
+
+def _extractive_summary(text: str, max_sentences: int = SUMMY_MAX_SENTENCES) -> str:
+    """Use sumy TextRank to reduce long text to top-ranked sentences (no LLM)."""
+    try:
+        import nltk
+        try:
+            nltk.data.find("tokenizers/punkt")
+        except LookupError:
+            nltk.download("punkt", quiet=True)
+
+        from sumy.parsers.plaintext import PlaintextParser
+        from sumy.nlp.tokenizers import Tokenizer
+        from sumy.summarizers.text_rank import TextRankSummarizer
+
+        parser = PlaintextParser.from_string(text, Tokenizer("english"))
+        summarizer = TextRankSummarizer()
+        n = min(max_sentences, len(parser.document.sentences))
+        if n <= 0:
+            return text
+        summary_sentences = summarizer(parser.document, n)
+        return " ".join(str(s) for s in summary_sentences)
+    except Exception:
+        return text
+
+
+def _truncate_for_validation(text: str, max_chars: int = VALIDATE_RESULT_MAX_CHARS) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n\n[... result truncated for validation ...]"
+
+
+def _truncate_for_summarize(text: str, max_chars: int = SUMMARIZE_RESULT_MAX_CHARS) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n\n[... truncated for context ...]"
+
 
 def _llm() -> ChatOpenAI:
     return ChatOpenAI(
@@ -105,6 +203,62 @@ def _ctx_status() -> str:
     return f"Agent is running... (context window: {used // 1000}k/{CONTEXT_WINDOW_MAX // 1000}k - {pct}%)"
 
 
+def _token_status() -> str:
+    """Status line during agent work (no token counts)."""
+    return "Agent is running..."
+
+
+_agent_running_ticker_stop: threading.Event | None = None
+_agent_running_ticker_interval = 0.5
+
+
+def _start_agent_running_ticker(status_obj) -> None:
+    """Start background ticker that updates status during agent work."""
+    global _agent_running_ticker_stop
+    if _agent_running_ticker_stop is not None:
+        _agent_running_ticker_stop.set()
+    _agent_running_ticker_stop = threading.Event()
+
+    def ticker():
+        while not _agent_running_ticker_stop.wait(_agent_running_ticker_interval):
+            status_obj.update(status=_token_status(), spinner="bouncingBall")
+
+    t = threading.Thread(target=ticker, daemon=True)
+    t.start()
+
+
+def _stop_agent_running_ticker() -> None:
+    """Stop the agent-running token ticker."""
+    global _agent_running_ticker_stop
+    if _agent_running_ticker_stop is not None:
+        _agent_running_ticker_stop.set()
+        _agent_running_ticker_stop = None
+
+
+@contextmanager
+def _thinking_with_elapsed_ticker(status_obj, min_seconds_before_ticker: int = 3, tick_interval: float = 1.0):
+    """Show 'Thinking...' during LLM invoke, then after min_seconds_before_ticker show 'Thinking... Ns', updating every tick_interval."""
+    stop_ev = threading.Event()
+    start_time = time()
+
+    def ticker():
+        if stop_ev.wait(min_seconds_before_ticker):
+            return
+        while not stop_ev.is_set():
+            elapsed = int(time() - start_time)
+            status_obj.update(status=f"Thinking... {elapsed}s", spinner="aesthetic")
+            if stop_ev.wait(tick_interval):
+                break
+
+    t = threading.Thread(target=ticker, daemon=True)
+    t.start()
+    try:
+        yield
+    finally:
+        stop_ev.set()
+        t.join(timeout=1.0)
+
+
 # ── Tools ─────────────────────────────────────────────────────────────────────
 
 @tool(description="Search the web for information")
@@ -128,10 +282,19 @@ def read_webpage(url: str) -> str:
     try:
         response = http_get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
         response.raise_for_status()
+        html_clean = _strip_html_noise(response.text)
         h = HTML2Text()
         h.ignore_links = False
         h.body_width = 0
-        return h.handle(response.text)
+        text = h.handle(html_clean)
+        text = _clean_extracted_text(text)
+        if len(text) > SUMMY_SUMMARIZE_WHEN_OVER_CHARS:
+            text = _extractive_summary(text, SUMMY_MAX_SENTENCES)
+            if len(text) > READ_WEBPAGE_MAX_CHARS:
+                text = text[:READ_WEBPAGE_MAX_CHARS] + "\n\n[... content truncated to fit context ...]"
+        elif len(text) > READ_WEBPAGE_MAX_CHARS:
+            text = text[:READ_WEBPAGE_MAX_CHARS] + "\n\n[... content truncated to fit context ...]"
+        return text
     except Exception as e:
         return f"Failed to fetch page: {e}"
 
@@ -240,7 +403,11 @@ class StartState(TypedDict):
 
 
 class EndState(TypedDict):
-    agent_response: str
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    tokens_sec: int
+    execution_time: int
 
 
 class Task(TypedDict):
@@ -350,9 +517,12 @@ Be concise. Do not over-plan. Only include steps that are necessary.""")
 
     global INPUT_TOKENS, OUTPUT_TOKENS
     log("Planning...")
-    status.update(status="Thinking...")
-    result = planner.invoke([guidance_prompt, action_prompt])
-    status.update(status=_ctx_status())
+    _stop_agent_running_ticker()
+    status.update(status="Thinking...", spinner="aesthetic")
+    with _thinking_with_elapsed_ticker(status, min_seconds_before_ticker=3):
+        result = planner.invoke([guidance_prompt, action_prompt])
+    status.update(status="Agent is running...", spinner="bouncingBall")
+    _start_agent_running_ticker(status)
 
     INPUT_TOKENS += result["raw"].usage_metadata["input_tokens"]
     OUTPUT_TOKENS += result["raw"].usage_metadata["output_tokens"]
@@ -418,12 +588,16 @@ def agent_execute(state: AgentState, *, store: BaseStore) -> AgentState:
         llm = _llm()
         hits = _bm25_search(store, ("task_results", state["run_id"]), current["description"], 5)
         completed_results = "\n\n".join(
-            f"Task {h.key} — {h.value['description']}:\n{h.value['result']}"
+            f"Task {h.key} — {h.value['description']}:\n{_truncate_for_summarize(h.value['result'])}"
             for h in hits
         ) or "No prior results available."
         guidance_prompt = SystemMessage(content="You are a summarization agent. Synthesize the provided information into a clear, concise summary.")
         action_prompt = HumanMessage(content=f"Task: {current['description']}\n\nContext:\n{completed_results}{retry_context}")
+        _stop_agent_running_ticker()
+        status.update(status="Thinking...", spinner="aesthetic")
         llm_response = llm.invoke([guidance_prompt, action_prompt])
+        status.update(status="Agent is running...", spinner="bouncingBall")
+        _start_agent_running_ticker(status)
         INPUT_TOKENS += llm_response.usage_metadata["input_tokens"]
         OUTPUT_TOKENS += llm_response.usage_metadata["output_tokens"]
         result = llm_response.content
@@ -438,15 +612,18 @@ If during execution you discover new work items (e.g. multiple URLs that each ne
         prior_context = (
             "\n\nRelevant prior results:\n" +
             "\n\n".join(
-                f"Task {h.key} — {h.value['description']}:\n{h.value['result']}"
+                f"Task {h.key} — {h.value['description']}:\n{_truncate_for_summarize(h.value['result'])}"
                 for h in hits
             )
             if hits else ""
         )
         action_prompt = HumanMessage(content=f"Task: {current['description']}\nSuggested input: {current['input_hint']}{prior_context}{retry_context}")
-        status.update(status="Thinking...")
-        response = executor.invoke([guidance_prompt, action_prompt])
-        status.update(status=_ctx_status())
+        _stop_agent_running_ticker()
+        status.update(status="Thinking...", spinner="aesthetic")
+        with _thinking_with_elapsed_ticker(status, min_seconds_before_ticker=3):
+            response = executor.invoke([guidance_prompt, action_prompt])
+        status.update(status="Agent is running...", spinner="bouncingBall")
+        _start_agent_running_ticker(status)
         INPUT_TOKENS += response.usage_metadata["input_tokens"]
         OUTPUT_TOKENS += response.usage_metadata["output_tokens"]
 
@@ -576,11 +753,15 @@ def agent_validate(state: AgentState, *, store: BaseStore) -> AgentState:
 Return valid=true if the result meaningfully addresses the task description.
 Return valid=false with a reason if the result is empty, an error, irrelevant, or clearly incomplete.""")
 
-    action_prompt = HumanMessage(content=f"Task: {current['description']}\nResult: {current['result']}")
+    result_for_prompt = _truncate_for_validation(current["result"])
+    action_prompt = HumanMessage(content=f"Task: {current['description']}\nResult: {result_for_prompt}")
 
-    status.update(status="Thinking...")
-    verdict = validator.invoke([guidance_prompt, action_prompt])
-    status.update(status=_ctx_status())
+    _stop_agent_running_ticker()
+    status.update(status="Thinking...", spinner="aesthetic")
+    with _thinking_with_elapsed_ticker(status, min_seconds_before_ticker=3):
+        verdict = validator.invoke([guidance_prompt, action_prompt])
+    status.update(status="Agent is running...", spinner="bouncingBall")
+    _start_agent_running_ticker(status)
     INPUT_TOKENS += verdict["raw"].usage_metadata["input_tokens"]
     OUTPUT_TOKENS += verdict["raw"].usage_metadata["output_tokens"]
 
@@ -631,7 +812,7 @@ def agent_terminate(state: AgentState, *, store: BaseStore) -> EndState:
 
     hits = _bm25_search(store, ("task_results", state["run_id"]), state["prompt"], 10)
     results_summary = "\n\n".join(
-        f"Task {h.key} — {h.value['description']}:\n{h.value['result']}"
+        f"Task {h.key} — {h.value['description']}:\n{_truncate_for_validation(h.value['result'])}"
         for h in hits
     ) or "No tasks completed."
 
@@ -650,16 +831,30 @@ Completed task results:
 {"Failed tasks:" + chr(10) + failure_summary if failed else ""}""")
 
     global INPUT_TOKENS, OUTPUT_TOKENS
-    status.update(status="Thinking...")
-    result = llm.invoke([guidance_prompt, action_prompt])
-    status.update(status="Complete")
+    _stop_agent_running_ticker()
+    status.update(status="Thinking...", spinner="aesthetic")
+    with _thinking_with_elapsed_ticker(status, min_seconds_before_ticker=3):
+        result = llm.invoke([guidance_prompt, action_prompt])
+    status.update(status="Complete", spinner="bouncingBall")
     status.stop()
     INPUT_TOKENS += result.usage_metadata["input_tokens"]
     OUTPUT_TOKENS += result.usage_metadata["output_tokens"]
 
+    console.print(Markdown(result.content))
+
+    execution_time = time() - START_TIME
+    total_tokens = INPUT_TOKENS + OUTPUT_TOKENS
+
     log("Done.")
     log(f"Total tokens — input: {INPUT_TOKENS:,}  output: {OUTPUT_TOKENS:,}")
-    return {"agent_response": result.content}
+
+    return {
+        "input_tokens": INPUT_TOKENS,
+        "output_tokens": OUTPUT_TOKENS,
+        "total_tokens": total_tokens,
+        "tokens_sec": 0,
+        "execution_time": int(execution_time)
+    }
 
 
 # ── Routing ────────────────────────────────────────────────────────────────────
@@ -695,14 +890,29 @@ agent = builder.compile(store=memory_store)
 
 
 if __name__ == "__main__":
-    start_prompt = """
-    find the official NYT RSS feed *list* via search.
-    read only the NYT RSS list then choose 3 categories and their URLs from this list not your memory.
-    read an article from each category and return a brief summary of each article.
-    finally provide a final summary of all 3 summaries
-    """
+    import argparse
+    from rich.markdown import Markdown
 
-    start_prompt = """
+    parser = argparse.ArgumentParser(description="Run the agent with an optional prompt.")
+    parser.add_argument(
+        "prompt",
+        nargs="?",
+        default=None,
+        help="Task prompt for the agent. If omitted, a default prompt is used.",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable LLM cache for this run (fresh API calls).",
+    )
+
+    args = parser.parse_args()
+
+    if args.prompt:
+        start_prompt = args.prompt
+
+    else:
+        start_prompt = """
     list files in this folder
     read each python file found in the list
     summarize each python app
