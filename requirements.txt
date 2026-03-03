@@ -1,0 +1,12 @@
+langgraph
+langchain
+langchain-openai
+langchain-community
+langchain-core
+langchain-classic
+typing_extensions
+shortuuid
+requests
+html2text
+python-dotenv
+rich
