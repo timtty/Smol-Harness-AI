@@ -4,13 +4,13 @@ from langgraph.graph import END
 
 from langchain.messages import SystemMessage
 from langchain.messages import HumanMessage
-from langchain.tools import tool
 
 from langchain_openai import ChatOpenAI
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 from langgraph.store.memory import InMemoryStore
 from langgraph.store.base import BaseStore
+from langgraph.config import get_store as _get_store
 from typing_extensions import TypedDict
 from typing_extensions import List
 from typing_extensions import Annotated
@@ -18,16 +18,6 @@ from shortuuid import uuid as suid
 
 from json import dumps as json_to_string
 from json import loads as json_parse
-
-from subprocess import run as subprocess_run
-from subprocess import PIPE
-from subprocess import TimeoutExpired
-
-from requests import get as http_get
-from html2text import HTML2Text
-from xml.etree.ElementTree import fromstring as xml_parse
-from bs4 import BeautifulSoup
-import re
 
 import sys
 from dotenv import load_dotenv
@@ -73,82 +63,10 @@ def log(message: str) -> None:
 
 MODEL = "qwen/qwen3-4b-2507"
 
-# Max chars of task result to send to validator (avoids context overflow from long webpages/files)
-VALIDATE_RESULT_MAX_CHARS = 24_000
+# Max chars of task result to send to validator (must fit in model context with system + task; keep conservative for small context models)
+VALIDATE_RESULT_MAX_CHARS = 6_000
 # Max chars per result when building context for summarize step (5 results × this = total cap)
 SUMMARIZE_RESULT_MAX_CHARS = 20_000
-# Max chars returned from read_webpage to avoid huge state and store
-READ_WEBPAGE_MAX_CHARS = 100_000
-# When cleaned text exceeds this, use sumy (TextRank) extractive summary instead of raw truncation
-SUMMY_SUMMARIZE_WHEN_OVER_CHARS = 25_000
-# Max sentences to keep when sumy summarization runs
-SUMMY_MAX_SENTENCES = 80
-
-# Elements to strip from HTML before conversion (noise, non-content)
-_STRIP_HTML_TAGS = (
-    "script", "style", "noscript", "iframe", "svg", "object", "embed",
-    "nav", "header", "footer", "aside", "form", "button", "input", "select", "textarea",
-)
-# Roles that usually wrap chrome, not main content
-_STRIP_HTML_ROLES = ("navigation", "banner", "contentinfo", "complementary", "search")
-
-
-def _strip_html_noise(html: str) -> str:
-    """Remove script, style, nav, and other typical noise before converting to text."""
-    soup = BeautifulSoup(html, "html.parser")
-    for tag in soup.find_all(_STRIP_HTML_TAGS):
-        tag.decompose()
-    for el in soup.find_all(attrs={"role": lambda v: v and v in _STRIP_HTML_ROLES}):
-        el.decompose()
-    # Prefer main content if present and substantial
-    main = soup.find("main") or soup.find("article")
-    if main and len(main.get_text(strip=True)) > 200:
-        body = main
-    else:
-        body = soup.find("body") or soup
-    return str(body)
-
-
-def _clean_extracted_text(text: str) -> str:
-    """Collapse excessive whitespace and drop common UI-only lines."""
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    text = re.sub(r"[ \t]+", " ", text)
-    lines = []
-    skip_phrases = re.compile(
-        r"^(share|tweet|subscribe|newsletter|cookie|accept all|manage preferences|"
-        r"follow us|related articles|read more|advertisement|sponsored|\\|/|·)$",
-        re.I,
-    )
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or skip_phrases.match(line) or len(line) <= 2:
-            continue
-        lines.append(line)
-    return "\n\n".join(lines)
-
-
-def _extractive_summary(text: str, max_sentences: int = SUMMY_MAX_SENTENCES) -> str:
-    """Use sumy TextRank to reduce long text to top-ranked sentences (no LLM)."""
-    try:
-        import nltk
-        try:
-            nltk.data.find("tokenizers/punkt")
-        except LookupError:
-            nltk.download("punkt", quiet=True)
-
-        from sumy.parsers.plaintext import PlaintextParser
-        from sumy.nlp.tokenizers import Tokenizer
-        from sumy.summarizers.text_rank import TextRankSummarizer
-
-        parser = PlaintextParser.from_string(text, Tokenizer("english"))
-        summarizer = TextRankSummarizer()
-        n = min(max_sentences, len(parser.document.sentences))
-        if n <= 0:
-            return text
-        summary_sentences = summarizer(parser.document, n)
-        return " ".join(str(s) for s in summary_sentences)
-    except Exception:
-        return text
 
 
 def _truncate_for_validation(text: str, max_chars: int = VALIDATE_RESULT_MAX_CHARS) -> str:
@@ -172,6 +90,15 @@ def _llm() -> ChatOpenAI:
 
 
 memory_store = InMemoryStore()
+
+
+def get_store() -> BaseStore:
+    """Use runtime store when available, else the graph's memory_store (same instance passed to compile)."""
+    try:
+        store = _get_store()
+        return store if store is not None else memory_store
+    except (RuntimeError, KeyError):
+        return memory_store
 
 
 def _bm25_search(store: BaseStore, namespace: tuple, query: str, limit: int) -> list:
@@ -259,141 +186,11 @@ def _thinking_with_elapsed_ticker(status_obj, min_seconds_before_ticker: int = 3
         t.join(timeout=1.0)
 
 
-# ── Tools ─────────────────────────────────────────────────────────────────────
+# ── Tools (from tools package) ───────────────────────────────────────────────────
 
-@tool(description="Search the web for information")
-def website_search(search_term: str) -> str:
-    response = http_get(
-        "https://api.search.brave.com/res/v1/web/search",
-        headers={"X-Subscription-Token": env["BRAVE_SEARCH_API_KEY"]},
-        params={"q": search_term},
-    )
-
-    if response.status_code == 200:
-        results = response.json().get("web", {}).get("results", [])
-        return json_to_string([{"title": r["title"], "url": r["url"], "description": r.get("description", "")} for r in results])
-
-    else:
-        return f"Search failed: {response.status_code}"
-
-
-@tool(description="Read and retrieve the content of a webpage by URL")
-def read_webpage(url: str) -> str:
-    try:
-        response = http_get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-        response.raise_for_status()
-        html_clean = _strip_html_noise(response.text)
-        h = HTML2Text()
-        h.ignore_links = False
-        h.body_width = 0
-        text = h.handle(html_clean)
-        text = _clean_extracted_text(text)
-        if len(text) > SUMMY_SUMMARIZE_WHEN_OVER_CHARS:
-            text = _extractive_summary(text, SUMMY_MAX_SENTENCES)
-            if len(text) > READ_WEBPAGE_MAX_CHARS:
-                text = text[:READ_WEBPAGE_MAX_CHARS] + "\n\n[... content truncated to fit context ...]"
-        elif len(text) > READ_WEBPAGE_MAX_CHARS:
-            text = text[:READ_WEBPAGE_MAX_CHARS] + "\n\n[... content truncated to fit context ...]"
-        return text
-    except Exception as e:
-        return f"Failed to fetch page: {e}"
-
-
-@tool(description="Read the contents of a local file by path")
-def read_file(path: str) -> str:
-    try:
-        with open(path, "r") as f:
-            return f.read()
-    except FileNotFoundError:
-        return f"File not found: {path}"
-    except PermissionError:
-        return f"Permission denied: {path}"
-    except Exception as e:
-        return f"Error reading file: {e}"
-
-
-@tool(description="Write content to a local file by path")
-def write_file(path: str, content: str) -> str:
-    try:
-        with open(path, "w") as f:
-            f.write(content)
-        return f"File written: {path}"
-    except PermissionError:
-        return f"Permission denied: {path}"
-    except Exception as e:
-        return f"Error writing file: {e}"
-
-
-@tool(description="Execute a bash command and return its stdout, stderr, and exit code. Use for local system operations, running scripts, listing files, etc. Avoid long-running or interactive commands.")
-def bash_execute(command: str, timeout_seconds: int = 30) -> str:
-    try:
-        proc = subprocess_run(
-            command,
-            shell=True,
-            stdout=PIPE,
-            stderr=PIPE,
-            text=True,
-            timeout=timeout_seconds,
-        )
-        output = proc.stdout.strip()
-        errors = proc.stderr.strip()
-        parts = [f"exit_code: {proc.returncode}"]
-        if output:
-            parts.append(f"stdout:\n{output}")
-        if errors:
-            parts.append(f"stderr:\n{errors}")
-        return "\n".join(parts)
-    except TimeoutExpired:
-        return f"Command timed out after {timeout_seconds}s"
-    except Exception as e:
-        return f"Error executing command: {e}"
-
-
-file_ops_tooling = [
-    read_file,
-    write_file,
-    bash_execute,
-]
-
-@tool(description="Fetch an RSS feed and return article titles, descriptions, and URLs. Prefer this over read_webpage when the URL ends in .xml or is a known RSS/Atom feed.")
-def fetch_rss_articles(feed_url: str, max_article_count: int = 5) -> str:
-    try:
-        response = http_get(feed_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-        response.raise_for_status()
-        root = xml_parse(response.content)
-        items = root.findall(".//item")
-        articles = []
-        for item in items[:max_article_count]:
-            title = (item.findtext("title") or "").strip()
-            desc  = (item.findtext("description") or "").strip()
-            link  = (item.findtext("link") or "").strip()
-            articles.append({"title": title, "description": desc[:300], "url": link})
-        return json_to_string(articles)
-    except Exception as e:
-        return f"Failed to fetch RSS feed: {e}"
-
-
-website_ops_tooling = [
-    website_search,
-    read_webpage,
-    fetch_rss_articles,
-]
-
-_pending_tasks: List[dict] = []
-
-
-@tool(description="Queue a new task to be executed. Use this when you discover new work during execution, such as finding URLs that each need to be read separately.")
-def add_task(description: str, action: str, input_hint: str) -> str:
-    _pending_tasks.append({
-        "description": description,
-        "action": action,
-        "input_hint": input_hint,
-    })
-    return f"Task queued: {description}"
-
-
-all_tools = file_ops_tooling + website_ops_tooling + [add_task]
-tool_map = {t.name: t for t in all_tools}
+from tools import all_tools, tool_map
+from tools.agent import get_pending_tasks, clear_pending_tasks
+from tools.bash import TRUNCATE_SUFFIX as BASH_TRUNCATE_SUFFIX
 
 
 # ── State ──────────────────────────────────────────────────────────────────────
@@ -497,7 +294,7 @@ Available actions:
 - fetch_rss_articles — fetch an RSS/Atom feed and return a compact list of articles; use this instead of read_webpage when the URL is an RSS feed (.xml)
 - read_file         — read a local file by path
 - write_file        — write content to a local file
-- bash_execute      — run a bash command and capture stdout/stderr/exit code; use for local system tasks, file listing, running scripts, etc.
+- bash_execute      — run bash/shell commands (e.g. AWS CLI: aws s3 ls, aws s3api list-buckets; gcloud; scripts). Use when the user asks to use AWS CLI, list buckets, run commands via bash, or any CLI/shell task.
 - summarize         — synthesize gathered content into a final output
 
 For each step output:
@@ -573,7 +370,7 @@ def task_manager(state: AgentState) -> AgentState:
     }
 
 
-def agent_execute(state: AgentState, *, store: BaseStore) -> AgentState:
+def agent_execute(state: AgentState) -> AgentState:
     global INPUT_TOKENS, OUTPUT_TOKENS
     current = next(t for t in state["tasks"] if t["task_id"] == state["current_task_id"])
 
@@ -586,6 +383,7 @@ def agent_execute(state: AgentState, *, store: BaseStore) -> AgentState:
 
     if current["action"] == "summarize":
         llm = _llm()
+        store = get_store()
         hits = _bm25_search(store, ("task_results", state["run_id"]), current["description"], 5)
         completed_results = "\n\n".join(
             f"Task {h.key} — {h.value['description']}:\n{_truncate_for_summarize(h.value['result'])}"
@@ -606,8 +404,11 @@ def agent_execute(state: AgentState, *, store: BaseStore) -> AgentState:
         llm = _llm()
         executor = llm.bind_tools(all_tools)
         guidance_prompt = SystemMessage(content="""You are a task execution agent. Use the available tools to complete the task.
+Use bash_execute when the task involves running shell commands, AWS CLI (e.g. list buckets, S3, EC2), or any other CLI. For "list buckets" or "use aws cli" use: bash_execute with command e.g. "aws s3 ls" or "aws s3api list-buckets".
 If prior task results are provided, extract URLs or data from them rather than performing a new search.
-If during execution you discover new work items (e.g. multiple URLs that each need to be read), use add_task to queue them rather than trying to handle everything yourself.""")
+If during execution you discover new work items (e.g. multiple URLs that each need to be read), use add_task to queue them rather than trying to handle everything yourself.
+If validation failed because output was truncated: retry with a different approach to get full data. For AWS list-buckets or large listings, use pagination (e.g. aws s3api list-buckets --max-items 20, then --starting-token for the next page; or split into multiple commands). Prefer commands that return complete, untruncated results.""")
+        store = get_store()
         hits = _bm25_search(store, ("task_results", state["run_id"]), current["description"], 3)
         prior_context = (
             "\n\nRelevant prior results:\n" +
@@ -717,7 +518,8 @@ If during execution you discover new work items (e.g. multiple URLs that each ne
         for t in state["tasks"]
     ]
 
-    if _pending_tasks:
+    pending = get_pending_tasks()
+    if pending:
         next_id = max(t["task_id"] for t in updated_tasks) + 1
         new_tasks = [
             {
@@ -730,9 +532,9 @@ If during execution you discover new work items (e.g. multiple URLs that each ne
                 "retry_count": 0,
                 "error_context": [],
             }
-            for i, t in enumerate(_pending_tasks)
+            for i, t in enumerate(pending)
         ]
-        _pending_tasks.clear()
+        clear_pending_tasks()
         updated_tasks = updated_tasks + new_tasks
         log(f"Added {len(new_tasks)} new task(s) to the plan")
         print_task_list(updated_tasks)
@@ -740,8 +542,9 @@ If during execution you discover new work items (e.g. multiple URLs that each ne
     return {"tasks": updated_tasks}
 
 
-def agent_validate(state: AgentState, *, store: BaseStore) -> AgentState:
+def agent_validate(state: AgentState) -> AgentState:
     global INPUT_TOKENS, OUTPUT_TOKENS
+    store = get_store()
     llm = _llm()
     validator = llm.with_structured_output(ValidationResult, include_raw=True)
 
@@ -749,9 +552,9 @@ def agent_validate(state: AgentState, *, store: BaseStore) -> AgentState:
 
     log(f"Validating task {current['task_id']}...")
 
-    guidance_prompt = SystemMessage(content="""You are a validation agent. Assess whether a task was completed successfully.
-Return valid=true if the result meaningfully addresses the task description.
-Return valid=false with a reason if the result is empty, an error, irrelevant, or clearly incomplete.""")
+    guidance_prompt = SystemMessage(content="""You are a validation agent. Assess whether the task was completed successfully.
+Return valid=true if the result meaningfully addresses the task description and is complete.
+Return valid=false with a reason if the result is empty, an error, irrelevant, clearly incomplete, or if the result explicitly states that output was truncated (e.g. "[... output truncated to fit context ...]"). When output was truncated, the reason must ask to retry with a different approach to get full data (e.g. pagination, --max-items, multiple requests).""")
 
     result_for_prompt = _truncate_for_validation(current["result"])
     action_prompt = HumanMessage(content=f"Task: {current['description']}\nResult: {result_for_prompt}")
@@ -762,10 +565,21 @@ Return valid=false with a reason if the result is empty, an error, irrelevant, o
         verdict = validator.invoke([guidance_prompt, action_prompt])
     status.update(status="Agent is running...", spinner="bouncingBall")
     _start_agent_running_ticker(status)
-    INPUT_TOKENS += verdict["raw"].usage_metadata["input_tokens"]
-    OUTPUT_TOKENS += verdict["raw"].usage_metadata["output_tokens"]
+    raw = verdict.get("raw")
+    if raw and getattr(raw, "usage_metadata", None):
+        INPUT_TOKENS += raw.usage_metadata.get("input_tokens", 0)
+        OUTPUT_TOKENS += raw.usage_metadata.get("output_tokens", 0)
 
-    if verdict["parsed"]["valid"]:
+    parsed = verdict.get("parsed") or {}
+    valid = parsed.get("valid", False)
+    reason = parsed.get("reason", "Validation response could not be parsed")
+
+    # If bash (or similar) output was truncated, force failure so the agent retries with pagination/different approach
+    if BASH_TRUNCATE_SUFFIX in (current.get("result") or ""):
+        valid = False
+        reason = "Output was truncated. Retry with a different approach to retrieve full data (e.g. pagination: --max-items, --starting-token; or multiple smaller commands)."
+
+    if valid:
         log(f"Task {current['task_id']} passed validation")
         store.put(
             ("task_results", state["run_id"]),
@@ -792,9 +606,9 @@ Return valid=false with a reason if the result is empty, an error, irrelevant, o
             for t in state["tasks"]
         ]
     else:
-        log(f"Task {current['task_id']} failed validation ({new_retry_count}/3): {verdict['parsed']['reason']}")
+        log(f"Task {current['task_id']} failed validation ({new_retry_count}/3): {reason}")
         updated_tasks = [
-            {**t, "status": "in_progress", "retry_count": new_retry_count, "error_context": current["error_context"] + [verdict["parsed"]["reason"]]}
+            {**t, "status": "in_progress", "retry_count": new_retry_count, "error_context": current["error_context"] + [reason]}
             if t["task_id"] == state["current_task_id"] else t
             for t in state["tasks"]
         ]
@@ -803,8 +617,9 @@ Return valid=false with a reason if the result is empty, an error, irrelevant, o
     return {"tasks": updated_tasks}
 
 
-def agent_terminate(state: AgentState, *, store: BaseStore) -> EndState:
+def agent_terminate(state: AgentState) -> EndState:
     llm = _llm()
+    store = get_store()
 
     failed = [t for t in state["tasks"] if t["status"] == "failed"]
 

@@ -4,7 +4,6 @@ from langgraph.graph import END
 
 from langchain.messages import SystemMessage
 from langchain.messages import HumanMessage
-from langchain.tools import tool
 
 from langchain_openai import ChatOpenAI
 from langchain_community.retrievers import BM25Retriever
@@ -16,12 +15,7 @@ from typing_extensions import List
 from typing_extensions import Annotated
 from shortuuid import uuid as suid
 
-from json import dumps as json_to_string
 from json import loads as json_parse
-
-from requests import get as http_get
-from html2text import HTML2Text
-from xml.etree.ElementTree import fromstring as xml_parse
 
 from dotenv import load_dotenv
 from os import environ as env
@@ -100,106 +94,10 @@ def _ctx_status() -> str:
     return f"Agent is running... (context window: {used // 1000}k/{CONTEXT_WINDOW_MAX // 1000}k - {pct}%)"
 
 
-# ── Tools ─────────────────────────────────────────────────────────────────────
+# ── Tools (from tools package) ───────────────────────────────────────────────────
 
-@tool(description="Search the web for information")
-def website_search(search_term: str) -> str:
-    response = http_get(
-        "https://api.search.brave.com/res/v1/web/search",
-        headers={"X-Subscription-Token": env["BRAVE_SEARCH_API_KEY"]},
-        params={"q": search_term},
-    )
-
-    if response.status_code == 200:
-        results = response.json().get("web", {}).get("results", [])
-        return json_to_string([{"title": r["title"], "url": r["url"], "description": r.get("description", "")} for r in results])
-
-    else:
-        return f"Search failed: {response.status_code}"
-
-
-@tool(description="Read and retrieve the content of a webpage by URL")
-def read_webpage(url: str) -> str:
-    try:
-        response = http_get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-        response.raise_for_status()
-        h = HTML2Text()
-        h.ignore_links = False
-        h.body_width = 0
-        return h.handle(response.text)
-    except Exception as e:
-        return f"Failed to fetch page: {e}"
-
-
-@tool(description="Read the contents of a local file by path")
-def read_file(path: str) -> str:
-    try:
-        with open(path, "r") as f:
-            return f.read()
-    except FileNotFoundError:
-        return f"File not found: {path}"
-    except PermissionError:
-        return f"Permission denied: {path}"
-    except Exception as e:
-        return f"Error reading file: {e}"
-
-
-@tool(description="Write content to a local file by path")
-def write_file(path: str, content: str) -> str:
-    try:
-        with open(path, "w") as f:
-            f.write(content)
-        return f"File written: {path}"
-    except PermissionError:
-        return f"Permission denied: {path}"
-    except Exception as e:
-        return f"Error writing file: {e}"
-
-
-file_ops_tooling = [
-    read_file,
-    write_file,
-]
-
-@tool(description="Fetch an RSS feed and return article titles, descriptions, and URLs. Prefer this over read_webpage when the URL ends in .xml or is a known RSS/Atom feed.")
-def fetch_rss_articles(feed_url: str, max_article_count: int = 5) -> str:
-    try:
-        response = http_get(feed_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-        response.raise_for_status()
-        root = xml_parse(response.content)
-        items = root.findall(".//item")
-        articles = []
-        for item in items[:max_article_count]:
-            title = (item.findtext("title") or "").strip()
-            desc  = (item.findtext("description") or "").strip()
-            link  = (item.findtext("link") or "").strip()
-            articles.append({"title": title, "description": desc[:300], "url": link})
-        return json_to_string(articles)
-    except Exception as e:
-        return f"Failed to fetch RSS feed: {e}"
-
-
-website_ops_tooling = [
-    website_search,
-    read_webpage,
-    fetch_rss_articles,
-]
-
-_pending_tasks: List[dict] = []
-
-
-@tool(description="Queue a new task to be executed. Use this when you discover new work during execution, such as finding URLs that each need to be read separately.")
-def add_task(description: str, action: str, input_hint: str) -> str:
-    _pending_tasks.append({
-        "description": description,
-        "action": action,
-        "input_hint": input_hint,
-    })
-    return f"Task queued: {description}"
-
-
-all_tools = file_ops_tooling + website_ops_tooling + [add_task]
-tool_map = {t.name: t for t in all_tools}
+from tools import all_tools, tool_map
+from tools.agent import get_pending_tasks, clear_pending_tasks
 
 
 # ── State ──────────────────────────────────────────────────────────────────────
@@ -299,6 +197,7 @@ Available actions:
 - fetch_rss_articles — fetch an RSS/Atom feed and return a compact list of articles; use this instead of read_webpage when the URL is an RSS feed (.xml)
 - read_file         — read a local file by path
 - write_file        — write content to a local file
+- bash_execute      — run bash/shell commands (e.g. AWS CLI: aws s3 ls, aws s3api list-buckets; gcloud; scripts). Use when the user asks to use AWS CLI, list buckets, run commands via bash, or any CLI/shell task.
 - summarize         — synthesize gathered content into a final output
 
 For each step output:
@@ -475,6 +374,11 @@ If during execution you discover new work items (e.g. multiple URLs that each ne
                     tool_tree.add(f"[green]{result}[/]")
                     console.print(tool_tree)
 
+                elif tool_name == "bash_execute":
+                    exit_line = result.split("\n")[0] if result else "exit_code: ?"
+                    tool_tree.add(f"[green]{exit_line}[/] — {len(result):,} chars")
+                    console.print(tool_tree)
+
                 else:
                     tool_tree.add(f"[green]{result[:120]}[/]")
                     console.print(tool_tree)
@@ -488,7 +392,8 @@ If during execution you discover new work items (e.g. multiple URLs that each ne
         for t in state["tasks"]
     ]
 
-    if _pending_tasks:
+    pending = get_pending_tasks()
+    if pending:
         next_id = max(t["task_id"] for t in updated_tasks) + 1
         new_tasks = [
             {
@@ -501,9 +406,9 @@ If during execution you discover new work items (e.g. multiple URLs that each ne
                 "retry_count": 0,
                 "error_context": [],
             }
-            for i, t in enumerate(_pending_tasks)
+            for i, t in enumerate(pending)
         ]
-        _pending_tasks.clear()
+        clear_pending_tasks()
         updated_tasks = updated_tasks + new_tasks
         log(f"Added {len(new_tasks)} new task(s) to the plan")
         print_task_list(updated_tasks)
