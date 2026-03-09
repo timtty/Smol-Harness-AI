@@ -3,14 +3,49 @@ Web tools: search, read webpage, fetch RSS.
 """
 
 import re
+import sqlite3
+import hashlib
 from json import dumps as json_to_string
+from os import makedirs
 
 from langchain.tools import tool
-from requests import get as http_get
+from curl_cffi.requests import get as http_get
 from html2text import HTML2Text
 from xml.etree.ElementTree import fromstring as xml_parse
 from bs4 import BeautifulSoup
 from os import environ as env
+
+# ── Search result cache ────────────────────────────────────────────────────────
+
+_SEARCH_CACHE_DB = ".cache/search.db"
+
+
+def _search_cache_conn() -> sqlite3.Connection:
+    makedirs(".cache", exist_ok=True)
+    conn = sqlite3.connect(_SEARCH_CACHE_DB)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS search_cache "
+        "(key TEXT PRIMARY KEY, result TEXT)"
+    )
+    conn.commit()
+    return conn
+
+
+def _search_cache_key(search_term: str, max_results: int, page: int) -> str:
+    raw = f"{search_term}|{max_results}|{page}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _cache_get(key: str) -> str | None:
+    with _search_cache_conn() as conn:
+        row = conn.execute("SELECT result FROM search_cache WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def _cache_put(key: str, result: str) -> None:
+    with _search_cache_conn() as conn:
+        conn.execute("INSERT OR REPLACE INTO search_cache (key, result) VALUES (?, ?)", (key, result))
+        conn.commit()
 
 # Config
 READ_WEBPAGE_MAX_CHARS = 100_000
@@ -80,23 +115,35 @@ def _extractive_summary(text: str, max_sentences: int = SUMMY_MAX_SENTENCES) -> 
         return text
 
 
-@tool(description="Search the web for information")
-def website_search(search_term: str) -> str:
+@tool(description="Search the web for information. max_results controls how many results to return (default 5, max 20). page selects the result page (default 1).")
+def website_search(search_term: str, max_results: int = 5, page: int = 1) -> str:
+    max_results = max(1, min(max_results, 20))
+    cache_key = _search_cache_key(search_term, max_results, page)
+    if not env.get("FRESH_RUN"):
+        cached = _cache_get(cache_key)
+        if cached:
+            return cached
+    offset = (page - 1) * max_results
     response = http_get(
         "https://api.search.brave.com/res/v1/web/search",
-        headers={"X-Subscription-Token": env["BRAVE_SEARCH_API_KEY"]},
-        params={"q": search_term},
+        headers={
+            "X-Subscription-Token": env["BRAVE_SEARCH_API_KEY"],
+            "Accept": "application/json",
+        },
+        params={"q": search_term, "count": max_results, "offset": offset},
     )
     if response.status_code == 200:
         results = response.json().get("web", {}).get("results", [])
-        return json_to_string([{"title": r["title"], "url": r["url"], "description": r.get("description", "")} for r in results])
+        result = json_to_string([{"title": r["title"], "url": r["url"]} for r in results[:max_results]])
+        _cache_put(cache_key, result)
+        return result
     return f"Search failed: {response.status_code}"
 
 
 @tool(description="Read and retrieve the content of a webpage by URL")
 def read_webpage(url: str) -> str:
     try:
-        response = http_get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        response = http_get(url, timeout=10, impersonate="chrome124")
         response.raise_for_status()
         html_clean = _strip_html_noise(response.text)
         h = HTML2Text()
@@ -116,7 +163,7 @@ def read_webpage(url: str) -> str:
 @tool(description="Fetch an RSS feed and return article titles, descriptions, and URLs. Prefer this over read_webpage when the URL ends in .xml or is a known RSS/Atom feed.")
 def fetch_rss_articles(feed_url: str, max_article_count: int = 5) -> str:
     try:
-        response = http_get(feed_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        response = http_get(feed_url, timeout=10, impersonate="chrome124")
         response.raise_for_status()
         root = xml_parse(response.content)
         items = root.findall(".//item")

@@ -30,6 +30,8 @@ import threading
 
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.live import Live
 from rich.prompt import Confirm
 from rich.table import Table
 from rich.tree import Tree
@@ -39,7 +41,7 @@ from rich import box
 
 console = Console()
 console.clear()
-status = console.status("Waking up...", spinner="aesthetic")
+status = console.status("Waking up...", spinner="dots5")
 
 load_dotenv()
 
@@ -61,7 +63,7 @@ def log(message: str) -> None:
     color = random_choice(PASTEL_COLORS)
     console.print(f"[{color}]●[/] {message}\n")
 
-MODEL = "qwen/qwen3-4b-2507"
+MODEL = env.get("AGENT_MODEL", "qwen/qwen3-4b-2507")
 
 # Max chars of task result to send to validator (must fit in model context with system + task; keep conservative for small context models)
 VALIDATE_RESULT_MAX_CHARS = 6_000
@@ -72,7 +74,7 @@ SUMMARIZE_RESULT_MAX_CHARS = 20_000
 def _truncate_for_validation(text: str, max_chars: int = VALIDATE_RESULT_MAX_CHARS) -> str:
     if len(text) <= max_chars:
         return text
-    return text[:max_chars] + "\n\n[... result truncated for validation ...]"
+    return text[:max_chars] + "\n\n[... preview trimmed for context window ...]"
 
 
 def _truncate_for_summarize(text: str, max_chars: int = SUMMARIZE_RESULT_MAX_CHARS) -> str:
@@ -148,7 +150,7 @@ def _start_agent_running_ticker(status_obj) -> None:
 
     def ticker():
         while not _agent_running_ticker_stop.wait(_agent_running_ticker_interval):
-            status_obj.update(status=_token_status(), spinner="bouncingBall")
+            status_obj.update(status=_token_status(), spinner="dots5")
 
     t = threading.Thread(target=ticker, daemon=True)
     t.start()
@@ -173,7 +175,7 @@ def _thinking_with_elapsed_ticker(status_obj, min_seconds_before_ticker: int = 3
             return
         while not stop_ev.is_set():
             elapsed = int(time() - start_time)
-            status_obj.update(status=f"Thinking... {elapsed}s", spinner="aesthetic")
+            status_obj.update(status=f"Thinking... {elapsed}s", spinner="dots5")
             if stop_ev.wait(tick_interval):
                 break
 
@@ -184,6 +186,96 @@ def _thinking_with_elapsed_ticker(status_obj, min_seconds_before_ticker: int = 3
     finally:
         stop_ev.set()
         t.join(timeout=1.0)
+
+
+def _stream_with_thoughts(llm_or_bound, messages, stream_content: bool = False):
+    """Stream an LLM call, printing reasoning tokens live as they arrive.
+
+    Works with plain ChatOpenAI and bind_tools() chains. Returns the final
+    merged AIMessageChunk which is API-compatible with AIMessage (content,
+    tool_calls, usage_metadata).
+
+    If stream_content=True, content tokens are also printed live as plain text.
+    """
+    _stop_agent_running_ticker()
+    status.stop()
+
+    final_chunk = None
+    last_usage = None
+    thinking_active = False
+    streamed_content = ""
+
+    try:
+        if stream_content:
+            content_panel_open = False
+            for chunk in llm_or_bound.stream(messages):
+                reasoning = (chunk.additional_kwargs or {}).get("reasoning_content", "")
+                if reasoning:
+                    if not thinking_active:
+                        console.print()
+                        console.print("[bold dim]┌ thinking[/bold dim]")
+                        thinking_active = True
+                    console.print(f"[dim]{reasoning}[/dim]", end="")
+
+                if chunk.content:
+                    if thinking_active:
+                        console.print()
+                        console.print("[bold dim]└──────────[/bold dim]")
+                        console.print()
+                        thinking_active = False
+                    if not content_panel_open:
+                        console.print()
+                        console.rule(style="dim white")
+                        console.print()
+                        content_panel_open = True
+                    console.print(chunk.content, end="", style="on grey11")
+                    streamed_content += chunk.content
+
+                if chunk.usage_metadata:
+                    last_usage = chunk.usage_metadata
+
+                if final_chunk is None:
+                    final_chunk = chunk
+                else:
+                    final_chunk = final_chunk + chunk
+
+            if content_panel_open:
+                console.print()
+                console.print()
+                console.rule(style="dim white")
+                console.print()
+        else:
+            for chunk in llm_or_bound.stream(messages):
+                reasoning = (chunk.additional_kwargs or {}).get("reasoning_content", "")
+                if reasoning:
+                    if not thinking_active:
+                        console.print()
+                        console.print("[bold dim]┌ thinking[/bold dim]")
+                        thinking_active = True
+                    console.print(f"[dim]{reasoning}[/dim]", end="")
+
+                if chunk.usage_metadata:
+                    last_usage = chunk.usage_metadata
+
+                if final_chunk is None:
+                    final_chunk = chunk
+                else:
+                    final_chunk = final_chunk + chunk
+
+            if thinking_active:
+                console.print()
+                console.print("[bold dim]└──────────[/bold dim]")
+                console.print()
+    finally:
+        status.start()
+        status.update(status="Agent is running...", spinner="dots5")
+        _start_agent_running_ticker(status)
+
+    # Ensure usage_metadata is accessible on the returned chunk
+    if final_chunk is not None and last_usage and not final_chunk.usage_metadata:
+        final_chunk.usage_metadata = last_usage
+
+    return final_chunk
 
 
 # ── Tools (from tools package) ───────────────────────────────────────────────────
@@ -289,12 +381,13 @@ def planning_agent(state: AgentState) -> AgentState:
     guidance_prompt = SystemMessage(content="""You are a planning agent. Decompose the user's task into a minimal, ordered sequence of executable steps.
 
 Available actions:
+- direct_response   — generate a response directly using your own knowledge, no tools needed. Use this for tasks that don't require searching, reading, or running commands (e.g. writing, math, lists, explanations, code generation). When this is the right choice, output it as the ONLY step.
 - website_search    — query the web for information
 - read_webpage      — fetch and read a URL (HTML pages, articles)
 - fetch_rss_articles — fetch an RSS/Atom feed and return a compact list of articles; use this instead of read_webpage when the URL is an RSS feed (.xml)
 - read_file         — read a local file by path
 - write_file        — write content to a local file
-- bash_execute      — run bash/shell commands (e.g. AWS CLI: aws s3 ls, aws s3api list-buckets; gcloud; scripts). Use when the user asks to use AWS CLI, list buckets, run commands via bash, or any CLI/shell task.
+- bash_execute      — run bash/shell commands (e.g. scripts, CLI tools, system operations)
 - summarize         — synthesize gathered content into a final output
 
 For each step output:
@@ -315,10 +408,10 @@ Be concise. Do not over-plan. Only include steps that are necessary.""")
     global INPUT_TOKENS, OUTPUT_TOKENS
     log("Planning...")
     _stop_agent_running_ticker()
-    status.update(status="Thinking...", spinner="aesthetic")
+    status.update(status="Thinking...", spinner="dots5")
     with _thinking_with_elapsed_ticker(status, min_seconds_before_ticker=3):
         result = planner.invoke([guidance_prompt, action_prompt])
-    status.update(status="Agent is running...", spinner="bouncingBall")
+    status.update(status="Agent is running...", spinner="dots5")
     _start_agent_running_ticker(status)
 
     INPUT_TOKENS += result["raw"].usage_metadata["input_tokens"]
@@ -355,7 +448,27 @@ def task_manager(state: AgentState) -> AgentState:
         log(f"No pending tasks, task list {reason}, terminating...")
         return {"termination_reason": reason}
 
+    # If any prior task failed, remaining sequential tasks can't be completed — abort the run
+    any_failed = any(t["status"] == "failed" for t in state["tasks"])
+    if any_failed:
+        log("A prior task failed — skipping remaining tasks and terminating...")
+        updated_tasks = [
+            {**t, "status": "failed"} if t["status"] == "pending" else t
+            for t in state["tasks"]
+        ]
+        print_task_list(updated_tasks)
+        return {"tasks": updated_tasks, "termination_reason": "incomplete"}
+
     next_task = pending[0]
+
+    # direct_response tasks bypass execute/validate — only when it's the sole task
+    if next_task["action"] == "direct_response" and len(state["tasks"]) == 1:
+        log("Direct response task — skipping execute/validate...")
+        updated_tasks = [
+            {**t, "status": "complete"} if t["task_id"] == next_task["task_id"] else t
+            for t in state["tasks"]
+        ]
+        return {"tasks": updated_tasks, "termination_reason": "direct_response"}
     log(f"Queuing task {next_task['task_id']}/{len(state['tasks'])}: {next_task['description']}")
     updated_tasks = [
         {**t, "status": "in_progress"} if t["task_id"] == next_task["task_id"] else t
@@ -381,7 +494,7 @@ def agent_execute(state: AgentState) -> AgentState:
     if current["error_context"]:
         retry_context = "\n\nPrevious attempt errors:\n" + "\n".join(current["error_context"])
 
-    if current["action"] == "summarize":
+    if current["action"] in ("summarize", "direct_response"):
         llm = _llm()
         store = get_store()
         hits = _bm25_search(store, ("task_results", state["run_id"]), current["description"], 5)
@@ -391,23 +504,24 @@ def agent_execute(state: AgentState) -> AgentState:
         ) or "No prior results available."
         guidance_prompt = SystemMessage(content="You are a summarization agent. Synthesize the provided information into a clear, concise summary.")
         action_prompt = HumanMessage(content=f"Task: {current['description']}\n\nContext:\n{completed_results}{retry_context}")
-        _stop_agent_running_ticker()
-        status.update(status="Thinking...", spinner="aesthetic")
-        llm_response = llm.invoke([guidance_prompt, action_prompt])
-        status.update(status="Agent is running...", spinner="bouncingBall")
-        _start_agent_running_ticker(status)
-        INPUT_TOKENS += llm_response.usage_metadata["input_tokens"]
-        OUTPUT_TOKENS += llm_response.usage_metadata["output_tokens"]
-        result = llm_response.content
+        llm_response = _stream_with_thoughts(llm, [guidance_prompt, action_prompt])
+        if llm_response and llm_response.usage_metadata:
+            INPUT_TOKENS += llm_response.usage_metadata["input_tokens"]
+            OUTPUT_TOKENS += llm_response.usage_metadata["output_tokens"]
+        result = llm_response.content if llm_response else ""
 
     else:
         llm = _llm()
         executor = llm.bind_tools(all_tools)
         guidance_prompt = SystemMessage(content="""You are a task execution agent. Use the available tools to complete the task.
-Use bash_execute when the task involves running shell commands, AWS CLI (e.g. list buckets, S3, EC2), or any other CLI. For "list buckets" or "use aws cli" use: bash_execute with command e.g. "aws s3 ls" or "aws s3api list-buckets".
 If prior task results are provided, extract URLs or data from them rather than performing a new search.
 If during execution you discover new work items (e.g. multiple URLs that each need to be read), use add_task to queue them rather than trying to handle everything yourself.
-If validation failed because output was truncated: retry with a different approach to get full data. For AWS list-buckets or large listings, use pagination (e.g. aws s3api list-buckets --max-items 20, then --starting-token for the next page; or split into multiple commands). Prefer commands that return complete, untruncated results.""")
+If validation failed because output was truncated, retry with a different approach to retrieve complete data (e.g. pagination, smaller requests, or multiple commands).
+When retrying after a failure, always try a meaningfully different approach — do not repeat the exact same command.
+Common recoverable errors and fixes:
+- Docker architecture mismatch (exec format error, platform mismatch): retry with --platform linux/amd64, or find a multi-arch or ARM-native alternative image.
+- Permission denied: retry with sudo or check file permissions first.
+- Command not found: check if the tool is installed, or find an alternative.""")
         store = get_store()
         hits = _bm25_search(store, ("task_results", state["run_id"]), current["description"], 3)
         prior_context = (
@@ -420,10 +534,10 @@ If validation failed because output was truncated: retry with a different approa
         )
         action_prompt = HumanMessage(content=f"Task: {current['description']}\nSuggested input: {current['input_hint']}{prior_context}{retry_context}")
         _stop_agent_running_ticker()
-        status.update(status="Thinking...", spinner="aesthetic")
+        status.update(status="Thinking...", spinner="dots5")
         with _thinking_with_elapsed_ticker(status, min_seconds_before_ticker=3):
             response = executor.invoke([guidance_prompt, action_prompt])
-        status.update(status="Agent is running...", spinner="bouncingBall")
+        status.update(status="Agent is running...", spinner="dots5")
         _start_agent_running_ticker(status)
         INPUT_TOKENS += response.usage_metadata["input_tokens"]
         OUTPUT_TOKENS += response.usage_metadata["output_tokens"]
@@ -455,21 +569,36 @@ If validation failed because output was truncated: retry with a different approa
                 elapsed = time() - t0
 
                 if tool_name == "website_search":
-                    parsed = json_parse(result)
-                    tool_tree.add(f"[green]Retrieved {len(parsed)} results[/]")
-                    console.print(tool_tree)
-
-                    table = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
-                    table.add_column("#", style="dim", width=3)
-                    table.add_column("Title")
-                    table.add_column("URL", style="dim cyan")
-                    for i, r in enumerate(parsed[:5], 1):
-                        table.add_row(str(i), r["title"], r["url"])
-                    console.print(table)
-                    console.print(f"  [dim]elapsed: {elapsed:.2f}s[/dim]\n")
+                    try:
+                        parsed = json_parse(result) if result and result.strip() not in ("", "None") else []
+                    except Exception:
+                        parsed = []
+                    if not parsed:
+                        tool_tree.add("[red]Empty result from tool[/]")
+                        console.print(tool_tree)
+                        result = "[]"
+                    else:
+                        tool_tree.add(f"[green]Retrieved {len(parsed)} results[/]")
+                        console.print(tool_tree)
+                        table = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
+                        table.add_column("#", style="dim", width=3)
+                        table.add_column("Title")
+                        table.add_column("URL", style="dim cyan")
+                        for i, r in enumerate(parsed, 1):
+                            table.add_row(str(i), r["title"], r["url"])
+                        console.print(table)
+                        console.print(f"  [dim]elapsed: {elapsed:.2f}s[/dim]\n")
 
                 elif tool_name == "fetch_rss_articles":
-                    parsed = json_parse(result)
+                    try:
+                        parsed = json_parse(result) if result and result.strip() not in ("", "None") else []
+                    except Exception:
+                        parsed = []
+                    if not parsed:
+                        tool_tree.add("[red]Empty result from tool[/]")
+                        console.print(tool_tree)
+                        result = "[]"
+                        continue
                     tool_tree.add(f"[green]Retrieved {len(parsed)} articles[/]")
                     console.print(tool_tree)
                     table = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
@@ -553,17 +682,22 @@ def agent_validate(state: AgentState) -> AgentState:
     log(f"Validating task {current['task_id']}...")
 
     guidance_prompt = SystemMessage(content="""You are a validation agent. Assess whether the task was completed successfully.
-Return valid=true if the result meaningfully addresses the task description and is complete.
-Return valid=false with a reason if the result is empty, an error, irrelevant, clearly incomplete, or if the result explicitly states that output was truncated (e.g. "[... output truncated to fit context ...]"). When output was truncated, the reason must ask to retry with a different approach to get full data (e.g. pagination, --max-items, multiple requests).""")
+Return valid=true if the result meaningfully addresses the task description. A result that ends with "[... preview trimmed for context window ...]" is still valid — that marker only means the result was long and was shortened for this prompt, not that the task failed.
+Return valid=false with a reason if the result is empty, an error, irrelevant, or clearly incomplete. Only treat truncation as a failure if the result itself contains a tool-level truncation marker such as "[... content truncated to fit context ...]" or "[... output truncated ...]".
+When returning valid=false, always provide a specific, actionable retry instruction — not just a description of the problem. Examples:
+- Architecture mismatch / exec format error → "Retry with --platform linux/amd64, or search for a multi-arch or ARM64-native alternative image."
+- Command not found → "Retry after checking if the tool is installed, or use an alternative command."
+- Empty output → "Retry with a different approach or verify the input is correct." """)
+
 
     result_for_prompt = _truncate_for_validation(current["result"])
     action_prompt = HumanMessage(content=f"Task: {current['description']}\nResult: {result_for_prompt}")
 
     _stop_agent_running_ticker()
-    status.update(status="Thinking...", spinner="aesthetic")
+    status.update(status="Thinking...", spinner="dots5")
     with _thinking_with_elapsed_ticker(status, min_seconds_before_ticker=3):
         verdict = validator.invoke([guidance_prompt, action_prompt])
-    status.update(status="Agent is running...", spinner="bouncingBall")
+    status.update(status="Agent is running...", spinner="dots5")
     _start_agent_running_ticker(status)
     raw = verdict.get("raw")
     if raw and getattr(raw, "usage_metadata", None):
@@ -618,12 +752,34 @@ Return valid=false with a reason if the result is empty, an error, irrelevant, c
 
 
 def agent_terminate(state: AgentState) -> EndState:
+    global INPUT_TOKENS, OUTPUT_TOKENS
     llm = _llm()
     store = get_store()
 
     failed = [t for t in state["tasks"] if t["status"] == "failed"]
 
     log(f"Terminating ({state['termination_reason']}): {len(failed)} failed. Generating final response...")
+
+    # Direct response: no tool results — just answer the original prompt
+    if state["termination_reason"] == "direct_response":
+        guidance_prompt = SystemMessage(content="You are a helpful assistant. Respond directly and completely to the user's request.")
+        action_prompt = HumanMessage(content=state["prompt"])
+        result = _stream_with_thoughts(llm, [guidance_prompt, action_prompt], stream_content=True)
+        status.stop()
+        if result and result.usage_metadata:
+            INPUT_TOKENS += result.usage_metadata["input_tokens"]
+            OUTPUT_TOKENS += result.usage_metadata["output_tokens"]
+        execution_time = time() - START_TIME
+        total_tokens = INPUT_TOKENS + OUTPUT_TOKENS
+        log("Done.")
+        log(f"Total tokens — input: {INPUT_TOKENS:,}  output: {OUTPUT_TOKENS:,}")
+        return {
+            "input_tokens": INPUT_TOKENS,
+            "output_tokens": OUTPUT_TOKENS,
+            "total_tokens": total_tokens,
+            "tokens_sec": 0,
+            "execution_time": int(execution_time),
+        }
 
     hits = _bm25_search(store, ("task_results", state["run_id"]), state["prompt"], 10)
     results_summary = "\n\n".join(
@@ -645,17 +801,11 @@ Completed task results:
 
 {"Failed tasks:" + chr(10) + failure_summary if failed else ""}""")
 
-    global INPUT_TOKENS, OUTPUT_TOKENS
-    _stop_agent_running_ticker()
-    status.update(status="Thinking...", spinner="aesthetic")
-    with _thinking_with_elapsed_ticker(status, min_seconds_before_ticker=3):
-        result = llm.invoke([guidance_prompt, action_prompt])
-    status.update(status="Complete", spinner="bouncingBall")
+    result = _stream_with_thoughts(llm, [guidance_prompt, action_prompt], stream_content=True)
     status.stop()
-    INPUT_TOKENS += result.usage_metadata["input_tokens"]
-    OUTPUT_TOKENS += result.usage_metadata["output_tokens"]
-
-    console.print(Markdown(result.content))
+    if result and result.usage_metadata:
+        INPUT_TOKENS += result.usage_metadata["input_tokens"]
+        OUTPUT_TOKENS += result.usage_metadata["output_tokens"]
 
     execution_time = time() - START_TIME
     total_tokens = INPUT_TOKENS + OUTPUT_TOKENS

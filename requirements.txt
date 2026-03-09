@@ -6,7 +6,7 @@ langchain-core
 langchain-classic
 typing_extensions
 shortuuid
-requests
+curl_cffi
 html2text
 beautifulsoup4
 sumy
