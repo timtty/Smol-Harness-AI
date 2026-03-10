@@ -4,6 +4,7 @@ from langgraph.graph import END
 
 from langchain.messages import SystemMessage
 from langchain.messages import HumanMessage
+from langchain_core.messages import ToolMessage
 
 from langchain_openai import ChatOpenAI
 from langchain_community.retrievers import BM25Retriever
@@ -14,12 +15,15 @@ from langgraph.config import get_store as _get_store
 from typing_extensions import TypedDict
 from typing_extensions import List
 from typing_extensions import Annotated
+from pydantic import BaseModel
 from shortuuid import uuid as suid
 
 from json import dumps as json_to_string
 from json import loads as json_parse
 
 import sys
+import warnings
+warnings.filterwarnings("ignore", message="Pydantic serializer warnings", category=UserWarning, module="pydantic")
 from dotenv import load_dotenv
 from os import environ as env
 from random import choice as random_choice
@@ -64,6 +68,7 @@ def log(message: str) -> None:
     console.print(f"[{color}]●[/] {message}\n")
 
 MODEL = env.get("AGENT_MODEL", "qwen/qwen3-4b-2507")
+SHOW_THINKING = env.get("SHOW_THINKING", "").lower() in ("1", "true", "yes")
 
 # Max chars of task result to send to validator (must fit in model context with system + task; keep conservative for small context models)
 VALIDATE_RESULT_MAX_CHARS = 6_000
@@ -228,7 +233,7 @@ def _stream_with_thoughts(llm_or_bound, messages, stream_content: bool = False):
                         console.rule(style="dim white")
                         console.print()
                         content_panel_open = True
-                    console.print(chunk.content, end="", style="on grey11")
+                    console.print(chunk.content, end="")
                     streamed_content += chunk.content
 
                 if chunk.usage_metadata:
@@ -321,21 +326,28 @@ class AgentState(TypedDict):
 
 # ── Planner structured output schemas ─────────────────────────────────────────
 
-class PlanStep(TypedDict):
+class PlanStep(BaseModel):
     step_id: int
     description: str
     action: str      # website_search | read_webpage | fetch_rss_articles | read_file | write_file | bash_execute | summarize
     input_hint: str  # specific query, URL, path, or instruction for this step
 
-class ExecutionPlan(TypedDict):
+class ExecutionPlan(BaseModel):
     steps: List[PlanStep]
 
 
 # ── Validator structured output schema ────────────────────────────────────────
 
-class ValidationResult(TypedDict):
+class ValidationResult(BaseModel):
     valid: bool
     reason: str
+
+
+# ── Re-planner structured output schema ───────────────────────────────────────
+
+class ReplanResult(BaseModel):
+    termination_reason: str   # "complete" | "impossible" | "incomplete" | "" (continue with additional_steps)
+    additional_steps: List[PlanStep]
 
 
 # ── Task list display ──────────────────────────────────────────────────────────
@@ -361,6 +373,10 @@ def print_task_list(tasks: List[Task]) -> None:
 # ── Nodes ──────────────────────────────────────────────────────────────────────
 
 def agent_bootstrap(state: StartState) -> AgentState:
+    global START_TIME
+    console.print()
+    console.print(f" {state['start_prompt']} ", style="on grey30")
+    console.print()
     status.start()
     log("Bootstrapping agent...")
     START_TIME = time()
@@ -379,6 +395,8 @@ def planning_agent(state: AgentState) -> AgentState:
     planner = llm.with_structured_output(ExecutionPlan, include_raw=True)
 
     guidance_prompt = SystemMessage(content="""You are a planning agent. Decompose the user's task into a minimal, ordered sequence of executable steps.
+
+CRITICAL: You MUST always output at least one step. An empty steps list is never valid.
 
 Available actions:
 - direct_response   — generate a response directly using your own knowledge, no tools needed. Use this for tasks that don't require searching, reading, or running commands (e.g. writing, math, lists, explanations, code generation). When this is the right choice, output it as the ONLY step.
@@ -401,6 +419,13 @@ URL usage rules:
 - If a prior step will produce URLs (e.g. a search or feed list), plan subsequent steps as read_webpage and set input_hint to describe which URL to extract from the prior step result (e.g. "use the first article URL from step 1 result").
 - Never search for something that can be read directly from a URL obtained in a prior step.
 
+Examples:
+User: "search for python news"
+Steps: [{"step_id":1,"description":"Search for python news","action":"website_search","input_hint":"python news"}]
+
+User: "what is 2+2"
+Steps: [{"step_id":1,"description":"Answer the math question","action":"direct_response","input_hint":"what is 2+2"}]
+
 Be concise. Do not over-plan. Only include steps that are necessary.""")
 
     action_prompt = HumanMessage(content=state["prompt"])
@@ -409,13 +434,29 @@ Be concise. Do not over-plan. Only include steps that are necessary.""")
     log("Planning...")
     _stop_agent_running_ticker()
     status.update(status="Thinking...", spinner="dots5")
-    with _thinking_with_elapsed_ticker(status, min_seconds_before_ticker=3):
-        result = planner.invoke([guidance_prompt, action_prompt])
+
+    parsed = None
+    for attempt in range(3):
+        with _thinking_with_elapsed_ticker(status, min_seconds_before_ticker=3):
+            result = planner.invoke([guidance_prompt, action_prompt])
+        INPUT_TOKENS += result["raw"].usage_metadata["input_tokens"]
+        OUTPUT_TOKENS += result["raw"].usage_metadata["output_tokens"]
+        parsed = result["parsed"]
+        if parsed is not None:
+            break
+        log(f"Planner parse failed (attempt {attempt + 1}/3), retrying...")
+
     status.update(status="Agent is running...", spinner="dots5")
     _start_agent_running_ticker(status)
 
-    INPUT_TOKENS += result["raw"].usage_metadata["input_tokens"]
-    OUTPUT_TOKENS += result["raw"].usage_metadata["output_tokens"]
+    if parsed and parsed.steps:
+        steps = [
+            {"step_id": s.step_id, "description": s.description, "action": s.action, "input_hint": s.input_hint}
+            for s in parsed.steps
+        ]
+    else:
+        log("Planner returned empty plan — falling back to direct_response")
+        steps = [{"step_id": 1, "description": state["prompt"], "action": "direct_response", "input_hint": state["prompt"]}]
 
     tasks = [
         {
@@ -428,9 +469,9 @@ Be concise. Do not over-plan. Only include steps that are necessary.""")
             "retry_count": 0,
             "error_context": [],
         }
-        for step in result["parsed"]["steps"]
+        for step in steps
     ]
-    log(f"Created a plan with {len(result['parsed']['steps'])} task(s)")
+    log(f"Created a plan with {len(tasks)} task(s)")
     print_task_list(tasks)
     return {"tasks": tasks}
 
@@ -442,22 +483,21 @@ def task_manager(state: AgentState) -> AgentState:
 
     pending = [t for t in state["tasks"] if t["status"] == "pending"]
 
+    # No pending tasks — hand off to re-planner to decide whether to continue or terminate
     if not pending:
-        all_failed = all(t["status"] == "failed" for t in state["tasks"])
-        reason = "impossible" if all_failed else "complete"
-        log(f"No pending tasks, task list {reason}, terminating...")
-        return {"termination_reason": reason}
+        log("No pending tasks — handing off to re-planner...")
+        return {"termination_reason": ""}
 
-    # If any prior task failed, remaining sequential tasks can't be completed — abort the run
+    # If any prior task failed, mark remaining pending as failed and hand off to re-planner
     any_failed = any(t["status"] == "failed" for t in state["tasks"])
     if any_failed:
-        log("A prior task failed — skipping remaining tasks and terminating...")
+        log("A prior task failed — passing to re-planner...")
         updated_tasks = [
             {**t, "status": "failed"} if t["status"] == "pending" else t
             for t in state["tasks"]
         ]
         print_task_list(updated_tasks)
-        return {"tasks": updated_tasks, "termination_reason": "incomplete"}
+        return {"tasks": updated_tasks, "termination_reason": ""}
 
     next_task = pending[0]
 
@@ -532,7 +572,7 @@ Common recoverable errors and fixes:
             )
             if hits else ""
         )
-        action_prompt = HumanMessage(content=f"Task: {current['description']}\nSuggested input: {current['input_hint']}{prior_context}{retry_context}")
+        action_prompt = HumanMessage(content=f"Task: {current['description']}\nRequired tool: {current['action']}\nSuggested input: {current['input_hint']}{prior_context}{retry_context}")
         _stop_agent_running_ticker()
         status.update(status="Thinking...", spinner="dots5")
         with _thinking_with_elapsed_ticker(status, min_seconds_before_ticker=3):
@@ -543,7 +583,8 @@ Common recoverable errors and fixes:
         OUTPUT_TOKENS += response.usage_metadata["output_tokens"]
 
         if response.tool_calls:
-            result = ""
+            tool_results: List[dict] = []  # {call_id, name, result}
+
             for call in response.tool_calls:
                 tool_name = call["name"]
                 tool_args = call["args"]
@@ -559,24 +600,24 @@ Common recoverable errors and fixes:
                     approved = Confirm.ask(f"[yellow]Allow bash:[/] [bold]{tool_args.get('command', '')}[/]")
                     status.start()
                     if not approved:
-                        result = "User declined to execute this command."
+                        tool_results.append({"call_id": call["id"], "name": tool_name, "result": "User declined to execute this command."})
                         log("Bash command declined by user")
                         continue
 
                 tool_tree = Tree(f'[bold]● {tool_name}[/]([cyan]"{first_arg}"[/])')
                 t0 = time()
-                result = str(tool_map[tool_name].invoke(tool_args))
+                tool_output = str(tool_map[tool_name].invoke(tool_args))
                 elapsed = time() - t0
 
                 if tool_name == "website_search":
                     try:
-                        parsed = json_parse(result) if result and result.strip() not in ("", "None") else []
+                        parsed = json_parse(tool_output) if tool_output and tool_output.strip() not in ("", "None") else []
                     except Exception:
                         parsed = []
                     if not parsed:
                         tool_tree.add("[red]Empty result from tool[/]")
                         console.print(tool_tree)
-                        result = "[]"
+                        tool_output = "[]"
                     else:
                         tool_tree.add(f"[green]Retrieved {len(parsed)} results[/]")
                         console.print(tool_tree)
@@ -591,52 +632,72 @@ Common recoverable errors and fixes:
 
                 elif tool_name == "fetch_rss_articles":
                     try:
-                        parsed = json_parse(result) if result and result.strip() not in ("", "None") else []
+                        parsed = json_parse(tool_output) if tool_output and tool_output.strip() not in ("", "None") else []
                     except Exception:
                         parsed = []
                     if not parsed:
                         tool_tree.add("[red]Empty result from tool[/]")
                         console.print(tool_tree)
-                        result = "[]"
-                        continue
-                    tool_tree.add(f"[green]Retrieved {len(parsed)} articles[/]")
-                    console.print(tool_tree)
-                    table = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
-                    table.add_column("#", style="dim", width=3)
-                    table.add_column("Title")
-                    table.add_column("URL", style="dim cyan")
-                    for i, r in enumerate(parsed, 1):
-                        table.add_row(str(i), r["title"], r["url"])
-                    console.print(table)
-                    console.print(f"  [dim]elapsed: {elapsed:.2f}s[/dim]\n")
+                        tool_output = "[]"
+                    else:
+                        tool_tree.add(f"[green]Retrieved {len(parsed)} articles[/]")
+                        console.print(tool_tree)
+                        table = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
+                        table.add_column("#", style="dim", width=3)
+                        table.add_column("Title")
+                        table.add_column("URL", style="dim cyan")
+                        for i, r in enumerate(parsed, 1):
+                            table.add_row(str(i), r["title"], r["url"])
+                        console.print(table)
+                        console.print(f"  [dim]elapsed: {elapsed:.2f}s[/dim]\n")
 
                 elif tool_name == "read_webpage":
-                    tool_tree.add(f"[green]Read {len(result):,} chars[/]")
+                    tool_tree.add(f"[green]Read {len(tool_output):,} chars[/]")
                     console.print(tool_tree)
-                    console.print(Markdown(result[:250]))
+                    console.print(Markdown(tool_output[:250]))
 
                 elif tool_name == "read_file":
-                    tool_tree.add(f"[green]Read {len(result):,} chars[/]")
+                    tool_tree.add(f"[green]Read {len(tool_output):,} chars[/]")
                     console.print(tool_tree)
 
                 elif tool_name == "write_file":
-                    tool_tree.add(f"[green]{result}[/]")
+                    tool_tree.add(f"[green]{tool_output}[/]")
                     console.print(tool_tree)
 
                 elif tool_name == "bash_execute":
-                    lines = result.splitlines()
+                    lines = tool_output.splitlines()
                     exit_line = next((l for l in lines if l.startswith("exit_code:")), "")
                     exit_code = exit_line.split(":", 1)[-1].strip() if exit_line else "?"
                     color = "green" if exit_code == "0" else "red"
-                    tool_tree.add(f"[{color}]exit {exit_code}[/] — {len(result):,} chars")
+                    tool_tree.add(f"[{color}]exit {exit_code}[/] — {len(tool_output):,} chars")
                     console.print(tool_tree)
                     preview = "\n".join(lines[1:6])
                     if preview:
                         console.print(f"  [dim]{preview}[/dim]")
 
                 else:
-                    tool_tree.add(f"[green]{result[:120]}[/]")
+                    tool_tree.add(f"[green]{tool_output[:120]}[/]")
                     console.print(tool_tree)
+
+                tool_results.append({"call_id": call["id"], "name": tool_name, "result": tool_output})
+
+            # Feed tool results back to the LLM for synthesis
+            if tool_results:
+                synthesis_messages = (
+                    [guidance_prompt, action_prompt, response]
+                    + [ToolMessage(content=tr["result"][:SUMMARIZE_RESULT_MAX_CHARS], tool_call_id=tr["call_id"]) for tr in tool_results]
+                )
+                _stop_agent_running_ticker()
+                status.update(status="Thinking...", spinner="dots5")
+                with _thinking_with_elapsed_ticker(status, min_seconds_before_ticker=3):
+                    synthesis = executor.invoke(synthesis_messages)
+                status.update(status="Agent is running...", spinner="dots5")
+                _start_agent_running_ticker(status)
+                INPUT_TOKENS += synthesis.usage_metadata["input_tokens"]
+                OUTPUT_TOKENS += synthesis.usage_metadata["output_tokens"]
+                result = synthesis.content or tool_results[-1]["result"]
+            else:
+                result = ""
 
         else:
             result = response.content
@@ -704,9 +765,9 @@ When returning valid=false, always provide a specific, actionable retry instruct
         INPUT_TOKENS += raw.usage_metadata.get("input_tokens", 0)
         OUTPUT_TOKENS += raw.usage_metadata.get("output_tokens", 0)
 
-    parsed = verdict.get("parsed") or {}
-    valid = parsed.get("valid", False)
-    reason = parsed.get("reason", "Validation response could not be parsed")
+    parsed = verdict.get("parsed")
+    valid = parsed.valid if parsed else False
+    reason = parsed.reason if parsed else "Validation response could not be parsed"
 
     # If bash (or similar) output was truncated, force failure so the agent retries with pagination/different approach
     if BASH_TRUNCATE_SUFFIX in (current.get("result") or ""):
@@ -764,51 +825,55 @@ def agent_terminate(state: AgentState) -> EndState:
     if state["termination_reason"] == "direct_response":
         guidance_prompt = SystemMessage(content="You are a helpful assistant. Respond directly and completely to the user's request.")
         action_prompt = HumanMessage(content=state["prompt"])
-        result = _stream_with_thoughts(llm, [guidance_prompt, action_prompt], stream_content=True)
-        status.stop()
-        if result and result.usage_metadata:
-            INPUT_TOKENS += result.usage_metadata["input_tokens"]
-            OUTPUT_TOKENS += result.usage_metadata["output_tokens"]
-        execution_time = time() - START_TIME
-        total_tokens = INPUT_TOKENS + OUTPUT_TOKENS
-        log("Done.")
-        log(f"Total tokens — input: {INPUT_TOKENS:,}  output: {OUTPUT_TOKENS:,}")
-        return {
-            "input_tokens": INPUT_TOKENS,
-            "output_tokens": OUTPUT_TOKENS,
-            "total_tokens": total_tokens,
-            "tokens_sec": 0,
-            "execution_time": int(execution_time),
-        }
-
-    hits = _bm25_search(store, ("task_results", state["run_id"]), state["prompt"], 10)
-    results_summary = "\n\n".join(
-        f"Task {h.key} — {h.value['description']}:\n{_truncate_for_validation(h.value['result'])}"
-        for h in hits
-    ) or "No tasks completed."
-
-    failure_summary = "\n".join(
-        f"Task {t['task_id']} — {t['description']}: failed after 3 attempts" for t in failed
-    )
-
-    guidance_prompt = SystemMessage(content="""You are a summarization agent. Given the results of completed tasks, produce a clear and concise final response to the original request.
+    else:
+        hits = _bm25_search(store, ("task_results", state["run_id"]), state["prompt"], 10)
+        results_summary = "\n\n".join(
+            f"Task {h.key} — {h.value['description']}:\n{_truncate_for_validation(h.value['result'])}"
+            for h in hits
+        ) or "No tasks completed."
+        failure_summary = "\n".join(
+            f"Task {t['task_id']} — {t['description']}: failed after 3 attempts" for t in failed
+        )
+        guidance_prompt = SystemMessage(content="""You are a summarization agent. Given the results of completed tasks, produce a clear and concise final response to the original request.
 If some tasks failed, acknowledge what could not be completed without dwelling on it.""")
-
-    action_prompt = HumanMessage(content=f"""Original request: {state["prompt"]}
+        action_prompt = HumanMessage(content=f"""Original request: {state["prompt"]}
 
 Completed task results:
 {results_summary}
 
 {"Failed tasks:" + chr(10) + failure_summary if failed else ""}""")
 
-    result = _stream_with_thoughts(llm, [guidance_prompt, action_prompt], stream_content=True)
     status.stop()
-    if result and result.usage_metadata:
-        INPUT_TOKENS += result.usage_metadata["input_tokens"]
-        OUTPUT_TOKENS += result.usage_metadata["output_tokens"]
+    console.print()
+    usage = None
+    thinking_buf = ""
+    thinking_active = False
+    for chunk in llm.stream([guidance_prompt, action_prompt]):
+        reasoning = (chunk.additional_kwargs or {}).get("reasoning_content", "")
+        if reasoning and SHOW_THINKING:
+            if not thinking_active:
+                console.print()
+                thinking_active = True
+            thinking_buf += reasoning
+            console.print(reasoning, end="", style="on grey30")
+        if chunk.content:
+            if thinking_active:
+                console.print()
+                console.print()
+                thinking_active = False
+            console.print(chunk.content, end="")
+        if chunk.usage_metadata:
+            usage = chunk.usage_metadata
+    console.print()
+    console.print()
+
+    if usage:
+        INPUT_TOKENS += usage["input_tokens"]
+        OUTPUT_TOKENS += usage["output_tokens"]
 
     execution_time = time() - START_TIME
     total_tokens = INPUT_TOKENS + OUTPUT_TOKENS
+    tokens_sec = int(total_tokens / execution_time) if execution_time > 0 else 0
 
     log("Done.")
     log(f"Total tokens — input: {INPUT_TOKENS:,}  output: {OUTPUT_TOKENS:,}")
@@ -817,15 +882,115 @@ Completed task results:
         "input_tokens": INPUT_TOKENS,
         "output_tokens": OUTPUT_TOKENS,
         "total_tokens": total_tokens,
-        "tokens_sec": 0,
+        "tokens_sec": tokens_sec,
         "execution_time": int(execution_time)
     }
+
+
+def agent_replan(state: AgentState) -> AgentState:
+    llm = _llm()
+    replanner = llm.with_structured_output(ReplanResult, include_raw=True)
+    store = get_store()
+
+    completed = [t for t in state["tasks"] if t["status"] == "complete"]
+    failed = [t for t in state["tasks"] if t["status"] == "failed"]
+
+    hits = _bm25_search(store, ("task_results", state["run_id"]), state["prompt"], 10)
+    results_summary = "\n\n".join(
+        f"Task {h.key} — {h.value['description']}:\n{_truncate_for_summarize(h.value['result'])}"
+        for h in hits
+    ) or "\n".join(
+        f"Task {t['task_id']} — {t['description']}: {t['result']}" for t in completed
+    ) or "No completed task results available."
+
+    failure_summary = "\n".join(
+        f"Task {t['task_id']} — {t['description']}: failed" for t in failed
+    ) or "None"
+
+    next_step_id = max((t["task_id"] for t in state["tasks"]), default=0) + 1
+
+    guidance_prompt = SystemMessage(content=f"""You are a re-planning agent. Your job is to review the original request and the results of completed tasks, then decide what to do next.
+
+Available actions for additional steps:
+- website_search    — query the web for information
+- read_webpage      — fetch and read a URL
+- fetch_rss_articles — fetch an RSS/Atom feed
+- read_file         — read a local file by path
+- write_file        — write content to a local file
+- bash_execute      — run bash/shell commands
+- summarize         — synthesize gathered content into a final output
+
+Decision rules:
+- If the original request has been fully addressed by the completed tasks, set termination_reason to "complete" and leave additional_steps empty.
+- If all tasks failed and no progress was made, set termination_reason to "impossible" and leave additional_steps empty.
+- If some tasks failed but partial progress was made and the goal is unachievable, set termination_reason to "incomplete" and leave additional_steps empty.
+- If additional work is still needed to fulfill the request, set termination_reason to "" and populate additional_steps with the next steps. New step_ids must start at {next_step_id}.
+
+Be decisive. Do not add steps that repeat already-completed work.""")
+
+    action_prompt = HumanMessage(content=f"""Original request: {state["prompt"]}
+
+Completed task results:
+{results_summary}
+
+Failed tasks:
+{failure_summary}""")
+
+    log("Re-planning...")
+    _stop_agent_running_ticker()
+    status.update(status="Thinking...", spinner="dots5")
+    with _thinking_with_elapsed_ticker(status, min_seconds_before_ticker=3):
+        result = replanner.invoke([guidance_prompt, action_prompt])
+    status.update(status="Agent is running...", spinner="dots5")
+    _start_agent_running_ticker(status)
+
+    global INPUT_TOKENS, OUTPUT_TOKENS
+    INPUT_TOKENS += result["raw"].usage_metadata["input_tokens"]
+    OUTPUT_TOKENS += result["raw"].usage_metadata["output_tokens"]
+
+    parsed = result["parsed"]
+    if parsed is None:
+        log("Re-planner parse failed — terminating as complete")
+        return {"termination_reason": "complete"}
+
+    if parsed.termination_reason:
+        log(f"Re-planner decided: {parsed.termination_reason}")
+        return {"termination_reason": parsed.termination_reason}
+
+    if not parsed.additional_steps:
+        log("Re-planner returned no additional steps — terminating as complete")
+        return {"termination_reason": "complete"}
+
+    new_tasks = [
+        {
+            "task_id": s.step_id,
+            "description": s.description,
+            "action": s.action,
+            "input_hint": s.input_hint,
+            "status": "pending",
+            "result": "",
+            "retry_count": 0,
+            "error_context": [],
+        }
+        for s in parsed.additional_steps
+    ]
+    log(f"Re-planner added {len(new_tasks)} task(s)")
+    updated_tasks = state["tasks"] + new_tasks
+    print_task_list(updated_tasks)
+    return {"tasks": updated_tasks, "termination_reason": ""}
 
 
 # ── Routing ────────────────────────────────────────────────────────────────────
 
 def route_task_manager(state: AgentState) -> str:
-    return "agent_terminate" if state["termination_reason"] else "agent_execute"
+    if state["termination_reason"] == "max_iterations":
+        return "agent_terminate"
+    has_work = any(t["status"] in ("pending", "in_progress") for t in state["tasks"])
+    return "agent_execute" if has_work else "agent_replan"
+
+
+def route_replan(state: AgentState) -> str:
+    return "agent_terminate" if state["termination_reason"] else "task_manager"
 
 
 def route_validate(state: AgentState) -> str:
@@ -838,6 +1003,7 @@ def route_validate(state: AgentState) -> str:
 builder = StateGraph(AgentState, input_schema=StartState, output_schema=EndState)
 builder.add_node("agent_bootstrap", agent_bootstrap)
 builder.add_node("agent_plan", planning_agent)
+builder.add_node("agent_replan", agent_replan)
 builder.add_node("task_manager", task_manager)
 builder.add_node("agent_execute", agent_execute)
 builder.add_node("agent_validate", agent_validate)
@@ -849,6 +1015,7 @@ builder.add_edge("agent_plan", "task_manager")
 builder.add_conditional_edges("task_manager", route_task_manager)
 builder.add_edge("agent_execute", "agent_validate")
 builder.add_conditional_edges("agent_validate", route_validate)
+builder.add_conditional_edges("agent_replan", route_replan)
 builder.add_edge("agent_terminate", END)
 
 agent = builder.compile(store=memory_store)
