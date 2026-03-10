@@ -115,6 +115,34 @@ def _extractive_summary(text: str, max_sentences: int = SUMMY_MAX_SENTENCES) -> 
         return text
 
 
+def _ddg_lite_search(search_term: str, max_results: int, page: int) -> str:
+    """Fallback search using DuckDuckGo Lite (no API key required)."""
+    # DDG lite uses s= as a result offset (multiples of 30 per page)
+    offset = (page - 1) * 30
+    params: dict = {"q": search_term, "o": "json", "api": "d.js", "kl": "us-en"}
+    if offset:
+        params["s"] = str(offset)
+    response = http_get(
+        "https://lite.duckduckgo.com/lite/",
+        params=params,
+        headers={"User-Agent": "Mozilla/5.0"},
+        impersonate="chrome124",
+        timeout=10,
+    )
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+    results = []
+    # DDG lite result links are <a class="result-link"> inside <td class="result-title">
+    for a in soup.select("a.result-link"):
+        title = a.get_text(strip=True)
+        url = a.get("href", "")
+        if title and url:
+            results.append({"title": title, "url": url})
+        if len(results) >= max_results:
+            break
+    return json_to_string(results)
+
+
 @tool(description="Search the web for information. max_results controls how many results to return (default 5, max 20). page selects the result page (default 1).")
 def website_search(search_term: str, max_results: int = 5, page: int = 1) -> str:
     max_results = max(1, min(max_results, 20))
@@ -123,21 +151,33 @@ def website_search(search_term: str, max_results: int = 5, page: int = 1) -> str
         cached = _cache_get(cache_key)
         if cached:
             return cached
-    offset = (page - 1) * max_results
-    response = http_get(
-        "https://api.search.brave.com/res/v1/web/search",
-        headers={
-            "X-Subscription-Token": env["BRAVE_SEARCH_API_KEY"],
-            "Accept": "application/json",
-        },
-        params={"q": search_term, "count": max_results, "offset": offset},
-    )
-    if response.status_code == 200:
-        results = response.json().get("web", {}).get("results", [])
-        result = json_to_string([{"title": r["title"], "url": r["url"]} for r in results[:max_results]])
+
+    brave_key = env.get("BRAVE_SEARCH_API_KEY")
+    if brave_key:
+        offset = (page - 1) * max_results
+        response = http_get(
+            "https://api.search.brave.com/res/v1/web/search",
+            headers={
+                "X-Subscription-Token": brave_key,
+                "Accept": "application/json",
+            },
+            params={"q": search_term, "count": max_results, "offset": offset},
+        )
+        if response.status_code == 200:
+            results = response.json().get("web", {}).get("results", [])
+            result = json_to_string([{"title": r["title"], "url": r["url"]} for r in results[:max_results]])
+            _cache_put(cache_key, result)
+            return result
+        # Key invalid or quota exceeded — fall through to DDG lite
+        if response.status_code not in (401, 402, 403, 429):
+            return f"Search failed: {response.status_code}"
+
+    try:
+        result = _ddg_lite_search(search_term, max_results, page)
         _cache_put(cache_key, result)
         return result
-    return f"Search failed: {response.status_code}"
+    except Exception as e:
+        return f"Search failed (DDG lite fallback): {e}"
 
 
 @tool(description="Read and retrieve the content of a webpage by URL")
