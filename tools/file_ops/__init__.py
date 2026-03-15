@@ -83,10 +83,43 @@ def find_lines(path: str, pattern: str, context_lines: int = 3) -> str:
     return header + "\n---\n".join(parts)
 
 
+@tool(description=(
+    "Edit a local file by replacing an exact string with new content. "
+    "Use find_lines first to locate the exact text to replace. "
+    "The old_string must match exactly (including whitespace and indentation). "
+    "Returns a confirmation message or an error if old_string is not found."
+))
+def edit_file(path: str, old_string: str, new_string: str) -> str:
+    """Replace old_string with new_string in the file at path."""
+    try:
+        with open(path, "r") as f:
+            content = f.read()
+    except FileNotFoundError:
+        return f"File not found: {path}"
+    except PermissionError:
+        return f"Permission denied: {path}"
+    except Exception as e:
+        return f"Error reading file: {e}"
+
+    if old_string not in content:
+        return f"old_string not found in {path}"
+
+    new_content = content.replace(old_string, new_string, 1)
+    try:
+        with open(path, "w") as f:
+            f.write(new_content)
+        return f"File edited: {path}"
+    except PermissionError:
+        return f"Permission denied writing: {path}"
+    except Exception as e:
+        return f"Error writing file: {e}"
+
+
 file_ops_tooling = [
     read_file,
     write_file,
+    edit_file,
     find_lines,
 ]
 
-__all__ = ["read_file", "write_file", "find_lines", "file_ops_tooling"]
+__all__ = ["read_file", "write_file", "edit_file", "find_lines", "file_ops_tooling"]

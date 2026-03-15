@@ -42,19 +42,23 @@ def log(message: str) -> None:
     color = random_choice(PASTEL_COLORS)
     console.print(f"[{color}]●[/] {message}\n")
 
-def _llm() -> ChatOpenAI:
-    return ChatOpenAI(
-        model=MODEL,
-        base_url=env.get("OPENAI_BASE_URL"),
-        api_key=env.get("OPENAI_API_KEY"),
-    )
-
-
 MAX_ITERATIONS = 20
 INPUT_TOKENS = 0
 OUTPUT_TOKENS = 0
 START_TIME = time()
-MODEL = "qwen/qwen3-4b-2507"
+
+DEFAULT_MODEL  = env.get("DEFAULT_MODEL",  "qwen/qwen3-4b-2507")
+PLAN_MODEL     = env.get("PLAN_MODEL",     DEFAULT_MODEL)
+EXECUTE_MODEL  = env.get("EXECUTE_MODEL",  DEFAULT_MODEL)
+VALIDATE_MODEL = env.get("VALIDATE_MODEL", DEFAULT_MODEL)
+
+
+def _llm(model: str = DEFAULT_MODEL) -> ChatOpenAI:
+    return ChatOpenAI(
+        model=model,
+        base_url=env.get("OPENAI_BASE_URL"),
+        api_key=env.get("OPENAI_API_KEY"),
+    )
 CONTEXT_WINDOW_MAX = 100_000
 
 
@@ -83,7 +87,7 @@ class EndState(TypedDict):
 class Task(TypedDict):
     task_id: int
     description: str
-    action: str            # website_search | read_webpage | fetch_rss_articles | read_file | write_file | summarize
+    action: str            # website_search | read_webpage | fetch_rss_articles | read_file | edit_file | write_file | bash_execute | summarize
     input_hint: str
     status: str            # pending | in_progress | complete | failed
     result: str
@@ -104,7 +108,7 @@ class AgentState(TypedDict):
 class PlanStep(TypedDict):
     step_id: int
     description: str
-    action: str      # website_search | read_webpage | fetch_rss_articles | read_file | write_file | summarize
+    action: str      # website_search | read_webpage | fetch_rss_articles | read_file | edit_file | write_file | bash_execute | summarize
     input_hint: str  # specific query, URL, path, or instruction for this step
 
 class ExecutionPlan(TypedDict):
@@ -154,7 +158,7 @@ def agent_bootstrap(state: StartState) -> AgentState:
 
 
 def planning_agent(state: AgentState) -> AgentState:
-    llm = _llm()
+    llm = _llm(PLAN_MODEL)
     planner = llm.with_structured_output(ExecutionPlan, include_raw=True)
 
     guidance_prompt = SystemMessage(content="""You are a planning agent. Decompose the user's task into a minimal, ordered sequence of executable steps.
@@ -164,7 +168,8 @@ Available actions:
 - read_webpage      — fetch and read a URL (HTML pages, articles)
 - fetch_rss_articles — fetch an RSS/Atom feed and return a compact list of articles; use this instead of read_webpage when the URL is an RSS feed (.xml)
 - read_file         — read a local file by path
-- write_file        — write content to a local file
+- edit_file         — replace an exact string in a local file with new content (targeted edit); use this for modifying existing file contents
+- write_file        — write full content to a local file (overwrites); use only when creating a new file or replacing everything
 - bash_execute      — run bash/shell commands (e.g. AWS CLI: aws s3 ls, aws s3api list-buckets; gcloud; scripts). Use when the user asks to use AWS CLI, list buckets, run commands via bash, or any CLI/shell task.
 - summarize         — synthesize gathered content into a final output
 
@@ -250,7 +255,7 @@ def agent_execute(state: AgentState) -> AgentState:
         retry_context = "\n\nPrevious attempt errors:\n" + "\n".join(current["error_context"])
 
     if current["action"] == "summarize":
-        llm = _llm()
+        llm = _llm(EXECUTE_MODEL)
         completed_results = "\n\n".join(
             f"Task {t['task_id']} — {t['description']}:\n{t['result']}"
             for t in state["tasks"] if t["status"] == "complete"
@@ -263,8 +268,18 @@ def agent_execute(state: AgentState) -> AgentState:
         result = llm_response.content
 
     else:
-        llm = _llm()
-        executor = llm.bind_tools(all_tools)
+        llm = _llm(EXECUTE_MODEL)
+        ACTION_TOOL_MAP = {
+            "read_file": "read_file",
+            "edit_file": "edit_file",
+            "write_file": "write_file",
+            "website_search": "website_search",
+            "read_webpage": "read_webpage",
+            "fetch_rss_articles": "fetch_rss_articles",
+            "bash_execute": "bash_execute",
+        }
+        forced_tool = ACTION_TOOL_MAP.get(current["action"])
+        executor = llm.bind_tools(all_tools, tool_choice=forced_tool) if forced_tool else llm.bind_tools(all_tools)
         guidance_prompt = SystemMessage(content="""You are a task execution agent. Use the available tools to complete the task.
 If prior task results are provided, extract URLs or data from them rather than performing a new search.
 If during execution you discover new work items (e.g. multiple URLs that each need to be read), use add_task to queue them rather than trying to handle everything yourself.""")
@@ -335,6 +350,10 @@ If during execution you discover new work items (e.g. multiple URLs that each ne
                     tool_tree.add(f"[green]Read {len(result):,} chars[/]")
                     console.print(tool_tree)
 
+                elif tool_name == "edit_file":
+                    tool_tree.add(f"[green]{result}[/]")
+                    console.print(tool_tree)
+
                 elif tool_name == "write_file":
                     tool_tree.add(f"[green]{result}[/]")
                     console.print(tool_tree)
@@ -383,7 +402,7 @@ If during execution you discover new work items (e.g. multiple URLs that each ne
 
 def agent_validate(state: AgentState) -> AgentState:
     global INPUT_TOKENS, OUTPUT_TOKENS
-    llm = _llm()
+    llm = _llm(VALIDATE_MODEL)
     validator = llm.with_structured_output(ValidationResult, include_raw=True)
 
     current = next(t for t in state["tasks"] if t["task_id"] == state["current_task_id"])
@@ -432,7 +451,7 @@ Return valid=false with a reason if the result is empty, an error, irrelevant, o
 
 
 def agent_terminate(state: AgentState) -> EndState:
-    llm = _llm()
+    llm = _llm(EXECUTE_MODEL)
 
     completed = [t for t in state["tasks"] if t["status"] == "complete"]
     failed = [t for t in state["tasks"] if t["status"] == "failed"]
