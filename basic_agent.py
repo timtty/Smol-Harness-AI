@@ -41,6 +41,7 @@ from rich.prompt import Confirm
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.tree import Tree
+from rich.status import Status
 from rich import box
 
 
@@ -629,78 +630,91 @@ Common recoverable errors and fixes:
                         log("Bash command declined by user")
                         continue
 
-                tool_tree = Tree(f'[bold]● {tool_name}[/]([cyan]"{first_arg}"[/])')
-                t0 = time()
-                tool_output = str(tool_map[tool_name].invoke(tool_args))
-                elapsed = time() - t0
+                # Animate the tree root with a spinner while the tool executes,
+                # then add the result child and let Live render the final state.
+                _stop_agent_running_ticker()
+                status.stop()
 
-                if tool_name == "website_search":
-                    try:
-                        parsed = json_parse(tool_output) if tool_output and tool_output.strip() not in ("", "None") else []
-                    except Exception:
-                        parsed = []
-                    if not parsed:
-                        tool_tree.add("[red]Empty result from tool[/]")
-                        console.print(tool_tree)
-                        tool_output = "[]"
-                    else:
-                        tool_tree.add(f"[green]Retrieved {len(parsed)} results[/]")
-                        console.print(tool_tree)
-                        table = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
-                        table.add_column("#", style="dim", width=3)
-                        table.add_column("Title")
-                        table.add_column("URL", style="dim cyan")
-                        for i, r in enumerate(parsed, 1):
-                            table.add_row(str(i), r["title"], r["url"])
-                        console.print(table)
-                        console.print(f"  [dim]elapsed: {elapsed:.2f}s[/dim]\n")
+                parsed = []  # used by website_search / fetch_rss_articles extras
+                bash_lines: List[str] = []
 
-                elif tool_name == "fetch_rss_articles":
-                    try:
-                        parsed = json_parse(tool_output) if tool_output and tool_output.strip() not in ("", "None") else []
-                    except Exception:
-                        parsed = []
-                    if not parsed:
-                        tool_tree.add("[red]Empty result from tool[/]")
-                        console.print(tool_tree)
-                        tool_output = "[]"
+                display_name = tool_name.replace("_", " ").title()
+                tool_tree = Tree(Status(
+                    f'[bold]{display_name}[/]([cyan]"{first_arg}"[/])',
+                    spinner="toggle8",
+                ))
+
+                with Live(tool_tree, console=console, refresh_per_second=12):
+                    t0 = time()
+                    tool_output = str(tool_map[tool_name].invoke(tool_args))
+                    elapsed = time() - t0
+
+                    if tool_name == "website_search":
+                        try:
+                            parsed = json_parse(tool_output) if tool_output and tool_output.strip() not in ("", "None") else []
+                        except Exception:
+                            parsed = []
+                        if not parsed:
+                            tool_tree.add("[red]Empty result from tool[/]")
+                            tool_output = "[]"
+                        else:
+                            tool_tree.add(f"[green]Retrieved {len(parsed)} results[/]")
+
+                    elif tool_name == "fetch_rss_articles":
+                        try:
+                            parsed = json_parse(tool_output) if tool_output and tool_output.strip() not in ("", "None") else []
+                        except Exception:
+                            parsed = []
+                        if not parsed:
+                            tool_tree.add("[red]Empty result from tool[/]")
+                            tool_output = "[]"
+                        else:
+                            tool_tree.add(f"[green]Retrieved {len(parsed)} articles[/]")
+
+                    elif tool_name in ("read_webpage", "read_file"):
+                        tool_tree.add(f"[green]Read {len(tool_output):,} chars[/]")
+
+                    elif tool_name == "find_lines":
+                        header = tool_output.splitlines()[0] if tool_output.splitlines() else tool_output
+                        tool_tree.add(f"[green]{header}[/]")
+
+                    elif tool_name == "write_file":
+                        tool_tree.add(f"[green]{tool_output}[/]")
+
+                    elif tool_name == "bash_execute":
+                        bash_lines = tool_output.splitlines()
+                        exit_line = next((l for l in bash_lines if l.startswith("exit_code:")), "")
+                        exit_code = exit_line.split(":", 1)[-1].strip() if exit_line else "?"
+                        color = "green" if exit_code == "0" else "red"
+                        tool_tree.add(f"[{color}]exit {exit_code}[/] — {len(tool_output):,} chars")
+
                     else:
-                        tool_tree.add(f"[green]Retrieved {len(parsed)} articles[/]")
-                        console.print(tool_tree)
-                        table = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
-                        table.add_column("#", style="dim", width=3)
-                        table.add_column("Title")
-                        table.add_column("URL", style="dim cyan")
-                        for i, r in enumerate(parsed, 1):
-                            table.add_row(str(i), r["title"], r["url"])
-                        console.print(table)
-                        console.print(f"  [dim]elapsed: {elapsed:.2f}s[/dim]\n")
+                        tool_tree.add(f"[green]{tool_output[:120]}[/]")
+
+                # Dynamic summarization for read tools (after Live, log is visible)
+                if tool_name in ("read_webpage", "read_file"):
+                    raw_len = len(tool_output)
+                    if raw_len > DYNAMIC_SUMMARIZE_THRESHOLD:
+                        log(f"{tool_name} returned {raw_len:,} chars — summarizing...")
+                        tool_output = _dynamic_summarize(current["description"], tool_output)
+                        log(f"Summarized to {len(tool_output):,} chars")
+
+                # Extra content printed below the tree
+                if tool_name in ("website_search", "fetch_rss_articles") and parsed:
+                    label = "Title" if tool_name == "website_search" else "Title"
+                    table = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan")
+                    table.add_column("#", style="dim", width=3)
+                    table.add_column(label)
+                    table.add_column("URL", style="dim cyan")
+                    for i, r in enumerate(parsed, 1):
+                        table.add_row(str(i), r["title"], r["url"])
+                    console.print(table)
+                    console.print(f"  [dim]elapsed: {elapsed:.2f}s[/dim]")
 
                 elif tool_name == "read_webpage":
-                    raw_len = len(tool_output)
-                    if raw_len > DYNAMIC_SUMMARIZE_THRESHOLD:
-                        log(f"read_webpage returned {raw_len:,} chars — summarizing...")
-                        tool_output = _dynamic_summarize(current["description"], tool_output)
-                        log(f"Summarized to {len(tool_output):,} chars")
-                    tool_tree.add(f"[green]Read {raw_len:,} chars[/]")
-                    console.print(tool_tree)
                     console.print(Markdown(tool_output[:250]))
 
-                elif tool_name == "read_file":
-                    raw_len = len(tool_output)
-                    if raw_len > DYNAMIC_SUMMARIZE_THRESHOLD:
-                        log(f"read_file returned {raw_len:,} chars — summarizing...")
-                        tool_output = _dynamic_summarize(current["description"], tool_output)
-                        log(f"Summarized to {len(tool_output):,} chars")
-                    tool_tree.add(f"[green]Read {raw_len:,} chars[/]")
-                    console.print(tool_tree)
-
                 elif tool_name == "find_lines":
-                    lines_out = tool_output.splitlines()
-                    header = lines_out[0] if lines_out else tool_output
-                    tool_tree.add(f"[green]{header}[/]")
-                    console.print(tool_tree)
-                    # Detect language from file extension
                     path_arg = tool_args.get("path", "")
                     ext = path_arg.rsplit(".", 1)[-1].lower() if "." in path_arg else ""
                     lang = {"py": "python", "js": "javascript", "ts": "typescript",
@@ -708,8 +722,7 @@ Common recoverable errors and fixes:
                             "json": "json", "md": "markdown", "toml": "toml",
                             "html": "html", "css": "css", "rs": "rust",
                             "go": "go", "java": "java", "rb": "ruby"}.get(ext, "text")
-                    # Parse blocks split by ---
-                    body = "\n".join(lines_out[1:])
+                    body = "\n".join(tool_output.splitlines()[1:])
                     for block in body.split("\n---\n"):
                         code_lines, matched, start = [], set(), None
                         for raw in block.splitlines():
@@ -737,24 +750,14 @@ Common recoverable errors and fixes:
                                 theme="monokai",
                             ))
 
-                elif tool_name == "write_file":
-                    tool_tree.add(f"[green]{tool_output}[/]")
-                    console.print(tool_tree)
-
                 elif tool_name == "bash_execute":
-                    lines = tool_output.splitlines()
-                    exit_line = next((l for l in lines if l.startswith("exit_code:")), "")
-                    exit_code = exit_line.split(":", 1)[-1].strip() if exit_line else "?"
-                    color = "green" if exit_code == "0" else "red"
-                    tool_tree.add(f"[{color}]exit {exit_code}[/] — {len(tool_output):,} chars")
-                    console.print(tool_tree)
-                    preview = "\n".join(lines[1:6])
+                    preview = "\n".join(bash_lines[1:6])
                     if preview:
                         console.print(f"  [dim]{preview}[/dim]")
 
-                else:
-                    tool_tree.add(f"[green]{tool_output[:120]}[/]")
-                    console.print(tool_tree)
+                console.print()
+                status.start()
+                _start_agent_running_ticker(status)
 
                 tool_results.append({"call_id": call["id"], "name": tool_name, "result": tool_output})
 
