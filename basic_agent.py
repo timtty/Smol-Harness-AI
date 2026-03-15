@@ -38,6 +38,7 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.live import Live
 from rich.prompt import Confirm
+from rich.syntax import Syntax
 from rich.table import Table
 from rich.tree import Tree
 from rich import box
@@ -330,7 +331,7 @@ class EndState(TypedDict):
 class Task(TypedDict):
     task_id: int
     description: str
-    action: str            # website_search | read_webpage | fetch_rss_articles | read_file | write_file | bash_execute | summarize
+    action: str            # website_search | read_webpage | fetch_rss_articles | find_lines | read_file | write_file | bash_execute | summarize
     input_hint: str
     status: str            # pending | in_progress | complete | failed
     result: str
@@ -352,7 +353,7 @@ class AgentState(TypedDict):
 class PlanStep(BaseModel):
     step_id: int
     description: str
-    action: str      # website_search | read_webpage | fetch_rss_articles | read_file | write_file | bash_execute | summarize
+    action: str      # website_search | read_webpage | fetch_rss_articles | find_lines | read_file | write_file | bash_execute | summarize
     input_hint: str  # specific query, URL, path, or instruction for this step
 
 class ExecutionPlan(BaseModel):
@@ -426,6 +427,7 @@ Available actions:
 - website_search    — query the web for information
 - read_webpage      — fetch and read a URL (HTML pages, articles)
 - fetch_rss_articles — fetch an RSS/Atom feed and return a compact list of articles; use this instead of read_webpage when the URL is an RSS feed (.xml)
+- find_lines        — search a file for lines matching a substring; returns line numbers + context. Use this before editing to locate the exact lines to change without reading the whole file
 - read_file         — read a local file by path
 - write_file        — write content to a local file
 - bash_execute      — run bash/shell commands (e.g. scripts, CLI tools, system operations)
@@ -692,6 +694,48 @@ Common recoverable errors and fixes:
                         log(f"Summarized to {len(tool_output):,} chars")
                     tool_tree.add(f"[green]Read {raw_len:,} chars[/]")
                     console.print(tool_tree)
+
+                elif tool_name == "find_lines":
+                    lines_out = tool_output.splitlines()
+                    header = lines_out[0] if lines_out else tool_output
+                    tool_tree.add(f"[green]{header}[/]")
+                    console.print(tool_tree)
+                    # Detect language from file extension
+                    path_arg = tool_args.get("path", "")
+                    ext = path_arg.rsplit(".", 1)[-1].lower() if "." in path_arg else ""
+                    lang = {"py": "python", "js": "javascript", "ts": "typescript",
+                            "sh": "bash", "yml": "yaml", "yaml": "yaml",
+                            "json": "json", "md": "markdown", "toml": "toml",
+                            "html": "html", "css": "css", "rs": "rust",
+                            "go": "go", "java": "java", "rb": "ruby"}.get(ext, "text")
+                    # Parse blocks split by ---
+                    body = "\n".join(lines_out[1:])
+                    for block in body.split("\n---\n"):
+                        code_lines, matched, start = [], set(), None
+                        for raw in block.splitlines():
+                            if not raw.strip():
+                                continue
+                            matched_line = raw.startswith("→")
+                            num_part = raw[1:].lstrip().split(":")[0].strip()
+                            try:
+                                lineno = int(num_part)
+                            except ValueError:
+                                continue
+                            code = raw.split(":", 1)[1] if ":" in raw else ""
+                            if start is None:
+                                start = lineno
+                            code_lines.append(code)
+                            if matched_line:
+                                matched.add(lineno)
+                        if code_lines and start is not None:
+                            console.print(Syntax(
+                                "\n".join(code_lines),
+                                lang,
+                                line_numbers=True,
+                                start_line=start,
+                                highlight_lines=matched,
+                                theme="monokai",
+                            ))
 
                 elif tool_name == "write_file":
                     tool_tree.add(f"[green]{tool_output}[/]")

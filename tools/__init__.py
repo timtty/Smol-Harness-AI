@@ -4,7 +4,7 @@ Import all_tools, file_ops_tooling, website_ops_tooling, add_task from here or f
 """
 
 from tools.web import website_ops_tooling
-from tools.file_ops import file_ops_tooling
+from tools.file_ops import file_ops_tooling, find_lines
 from tools.bash import bash_execute
 from tools.agent import add_task
 
@@ -21,6 +21,7 @@ __all__ = [
     "file_ops_tooling",
     "all_file_and_bash_tools",
     "bash_execute",
+    "find_lines",
     "add_task",
     "all_tools",
     "tool_map",
