@@ -22,6 +22,7 @@ from json import dumps as json_to_string
 from json import loads as json_parse
 
 import sys
+import re
 import warnings
 warnings.filterwarnings("ignore", message="Pydantic serializer warnings", category=UserWarning, module="pydantic")
 from dotenv import load_dotenv
@@ -74,6 +75,10 @@ SHOW_THINKING = env.get("SHOW_THINKING", "").lower() in ("1", "true", "yes")
 VALIDATE_RESULT_MAX_CHARS = 6_000
 # Max chars per result when building context for summarize step (5 results × this = total cap)
 SUMMARIZE_RESULT_MAX_CHARS = 20_000
+# Results longer than this are dynamically summarized before being stored for downstream retrieval
+DYNAMIC_SUMMARIZE_THRESHOLD = SUMMARIZE_RESULT_MAX_CHARS
+# Target char length for dynamically summarized results
+DYNAMIC_SUMMARIZE_TARGET_CHARS = 4_000
 
 
 def _truncate_for_validation(text: str, max_chars: int = VALIDATE_RESULT_MAX_CHARS) -> str:
@@ -86,6 +91,24 @@ def _truncate_for_summarize(text: str, max_chars: int = SUMMARIZE_RESULT_MAX_CHA
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + "\n\n[... truncated for context ...]"
+
+
+def _dynamic_summarize(task_description: str, result: str) -> str:
+    """Summarize a long task result down to ~DYNAMIC_SUMMARIZE_TARGET_CHARS using the LLM.
+    Preserves key facts, data, URLs, and findings needed by subsequent tasks."""
+    llm = _llm()
+    guidance = SystemMessage(content=(
+        f"You are a compression agent. Summarize the provided task result to under {DYNAMIC_SUMMARIZE_TARGET_CHARS} characters. "
+        "Preserve all key facts, named entities, URLs, numeric values, and findings that downstream tasks may need. "
+        "Drop verbose explanations, repeated content, and boilerplate. Output only the summary — no preamble."
+    ))
+    prompt = HumanMessage(content=f"Task: {task_description}\n\nResult:\n{result[:SUMMARIZE_RESULT_MAX_CHARS]}")
+    response = llm.invoke([guidance, prompt])
+    global INPUT_TOKENS, OUTPUT_TOKENS
+    if response.usage_metadata:
+        INPUT_TOKENS += response.usage_metadata["input_tokens"]
+        OUTPUT_TOKENS += response.usage_metadata["output_tokens"]
+    return response.content or result[:DYNAMIC_SUMMARIZE_TARGET_CHARS]
 
 
 def _llm() -> ChatOpenAI:
@@ -652,12 +675,22 @@ Common recoverable errors and fixes:
                         console.print(f"  [dim]elapsed: {elapsed:.2f}s[/dim]\n")
 
                 elif tool_name == "read_webpage":
-                    tool_tree.add(f"[green]Read {len(tool_output):,} chars[/]")
+                    raw_len = len(tool_output)
+                    if raw_len > DYNAMIC_SUMMARIZE_THRESHOLD:
+                        log(f"read_webpage returned {raw_len:,} chars — summarizing...")
+                        tool_output = _dynamic_summarize(current["description"], tool_output)
+                        log(f"Summarized to {len(tool_output):,} chars")
+                    tool_tree.add(f"[green]Read {raw_len:,} chars[/]")
                     console.print(tool_tree)
                     console.print(Markdown(tool_output[:250]))
 
                 elif tool_name == "read_file":
-                    tool_tree.add(f"[green]Read {len(tool_output):,} chars[/]")
+                    raw_len = len(tool_output)
+                    if raw_len > DYNAMIC_SUMMARIZE_THRESHOLD:
+                        log(f"read_file returned {raw_len:,} chars — summarizing...")
+                        tool_output = _dynamic_summarize(current["description"], tool_output)
+                        log(f"Summarized to {len(tool_output):,} chars")
+                    tool_tree.add(f"[green]Read {raw_len:,} chars[/]")
                     console.print(tool_tree)
 
                 elif tool_name == "write_file":
@@ -776,12 +809,17 @@ When returning valid=false, always provide a specific, actionable retry instruct
 
     if valid:
         log(f"Task {current['task_id']} passed validation")
+        stored_result = current["result"]
+        if len(stored_result) > DYNAMIC_SUMMARIZE_THRESHOLD:
+            log(f"Task {current['task_id']} result is {len(stored_result):,} chars — summarizing for store...")
+            stored_result = _dynamic_summarize(current["description"], stored_result)
+            log(f"Task {current['task_id']} summarized to {len(stored_result):,} chars")
         store.put(
             ("task_results", state["run_id"]),
             str(current["task_id"]),
             {
                 "description": current["description"],
-                "result": current["result"],
+                "result": stored_result,
                 "action": current["action"],
             }
         )
@@ -846,25 +884,23 @@ Completed task results:
     status.stop()
     console.print()
     usage = None
-    thinking_buf = ""
-    thinking_active = False
+    raw_content = ""
+
     for chunk in llm.stream([guidance_prompt, action_prompt]):
-        reasoning = (chunk.additional_kwargs or {}).get("reasoning_content", "")
-        if reasoning and SHOW_THINKING:
-            if not thinking_active:
-                console.print()
-                thinking_active = True
-            thinking_buf += reasoning
-            console.print(reasoning, end="", style="on grey30")
-        if chunk.content:
-            if thinking_active:
-                console.print()
-                console.print()
-                thinking_active = False
-            console.print(chunk.content, end="")
+        raw_content += chunk.content or ""
         if chunk.usage_metadata:
             usage = chunk.usage_metadata
-    console.print()
+
+    if SHOW_THINKING:
+        def _print_think(m):
+            console.print(m.group(1).strip(), style="on grey30")
+            console.print()
+            return ""
+        clean = re.sub(r"<think>(.*?)</think>", _print_think, raw_content, flags=re.DOTALL)
+    else:
+        clean = re.sub(r"<think>.*?</think>", "", raw_content, flags=re.DOTALL)
+
+    console.print(clean.strip())
     console.print()
 
     if usage:
