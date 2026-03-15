@@ -20,7 +20,6 @@ from time import time
 from time import sleep
 
 from rich.console import Console
-from rich.markdown import Markdown
 from rich.table import Table
 from rich.tree import Tree
 from rich import box
@@ -344,7 +343,18 @@ If during execution you discover new work items (e.g. multiple URLs that each ne
                 elif tool_name == "read_webpage":
                     tool_tree.add(f"[green]Read {len(result):,} chars[/]")
                     console.print(tool_tree)
-                    console.print(Markdown(result[:250]))
+                    preview = result.strip().replace("\n", " ")
+                    for ch in ".!?":
+                        idx = preview.find(ch, 60)
+                        if 60 <= idx <= 220:
+                            preview = preview[:idx + 1]
+                            break
+                    else:
+                        if len(preview) > 200:
+                            cut = preview.rfind(" ", 0, 200)
+                            preview = preview[: cut if cut > 100 else 200] + "…"
+                    console.print(f"  [dim]{preview}[/dim]")
+                    console.print(f"  [dim]elapsed: {elapsed:.2f}s[/dim]\n")
 
                 elif tool_name == "read_file":
                     tool_tree.add(f"[green]Read {len(result):,} chars[/]")
