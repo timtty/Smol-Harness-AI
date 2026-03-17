@@ -11,7 +11,7 @@ from os import makedirs
 from langchain.tools import tool
 from curl_cffi.requests import get as http_get, request as http_request
 from html2text import HTML2Text
-from xml.etree.ElementTree import fromstring as xml_parse
+from defusedxml.ElementTree import fromstring as xml_parse
 from bs4 import BeautifulSoup
 from os import environ as env
 

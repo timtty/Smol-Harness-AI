@@ -17,7 +17,7 @@ def bash_execute(command: str, timeout_seconds: int = 30) -> str:
     try:
         proc = subprocess_run(
             command,
-            shell=True,
+            shell=True,  # nosec B602 — intentional: this tool exists to execute arbitrary shell commands
             stdout=PIPE,
             stderr=PIPE,
             text=True,

@@ -12,3 +12,4 @@ beautifulsoup4
 sumy
 python-dotenv
 rich
+defusedxml

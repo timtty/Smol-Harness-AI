@@ -20,5 +20,21 @@ env/
 # Cache
 .cache/
 
+# Secrets / credentials
+*.key
+*.pem
+*.p12
+*.pfx
+*.secret
+secrets.*
+credentials.*
+
+# Databases
+*.sqlite
+*.db
+
+# Node
+node_modules/
+
 # OS
 .DS_Store
