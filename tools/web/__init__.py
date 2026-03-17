@@ -9,7 +9,7 @@ from json import dumps as json_to_string
 from os import makedirs
 
 from langchain.tools import tool
-from curl_cffi.requests import get as http_get
+from curl_cffi.requests import get as http_get, request as http_request
 from html2text import HTML2Text
 from xml.etree.ElementTree import fromstring as xml_parse
 from bs4 import BeautifulSoup
@@ -218,10 +218,51 @@ def fetch_rss_articles(feed_url: str, max_article_count: int = 5) -> str:
         return f"Failed to fetch RSS feed: {e}"
 
 
+@tool(description=(
+    "Make an HTTP API request and return the raw response. "
+    "Use this instead of read_webpage, website_search, or bash_execute whenever calling a REST API or any HTTP endpoint. "
+    "Supports GET, POST, PUT, PATCH, DELETE. "
+    "headers: optional dict of HTTP headers (e.g. Authorization, Content-Type). "
+    "params: optional dict of URL query parameters. "
+    "body: optional JSON-serializable dict sent as the request body (sets Content-Type: application/json automatically). "
+    "Returns the response body as a string, prefixed with the HTTP status code."
+))
+def call_api(
+    url: str,
+    method: str = "GET",
+    headers: dict | None = None,
+    params: dict | None = None,
+    body: dict | None = None,
+) -> str:
+    try:
+        req_headers = dict(headers or {})
+        json_body = None
+        if body is not None:
+            json_body = body
+            req_headers.setdefault("Content-Type", "application/json")
+
+        # Skip browser impersonation for local/private addresses — it breaks plain HTTP servers
+        from urllib.parse import urlparse as _urlparse
+        _host = _urlparse(url).hostname or ""
+        _is_local = _host in ("localhost", "127.0.0.1", "::1") or _host.startswith("192.168.") or _host.startswith("10.") or _host.startswith("172.")
+        _kwargs: dict = {"headers": req_headers, "params": params or {}, "json": json_body, "timeout": 15}
+        if not _is_local:
+            _kwargs["impersonate"] = "chrome124"
+        response = http_request(method.upper(), url, **_kwargs)
+        prefix = f"HTTP {response.status_code}\n"
+        try:
+            return prefix + json_to_string(response.json(), indent=2)
+        except Exception:
+            return prefix + response.text
+    except Exception as e:
+        return f"API request failed: {e}"
+
+
 website_ops_tooling = [
     website_search,
     read_webpage,
     fetch_rss_articles,
+    call_api,
 ]
 
-__all__ = ["website_search", "read_webpage", "fetch_rss_articles", "website_ops_tooling"]
+__all__ = ["website_search", "read_webpage", "fetch_rss_articles", "call_api", "website_ops_tooling"]

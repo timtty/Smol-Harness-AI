@@ -86,7 +86,7 @@ class EndState(TypedDict):
 class Task(TypedDict):
     task_id: int
     description: str
-    action: str            # website_search | read_webpage | fetch_rss_articles | read_file | edit_file | write_file | bash_execute | summarize
+    action: str            # website_search | read_webpage | fetch_rss_articles | call_api | read_file | edit_file | write_file | bash_execute | summarize
     input_hint: str
     status: str            # pending | in_progress | complete | failed
     result: str
@@ -107,7 +107,7 @@ class AgentState(TypedDict):
 class PlanStep(TypedDict):
     step_id: int
     description: str
-    action: str      # website_search | read_webpage | fetch_rss_articles | read_file | edit_file | write_file | bash_execute | summarize
+    action: str      # website_search | read_webpage | fetch_rss_articles | call_api | read_file | edit_file | write_file | bash_execute | summarize
     input_hint: str  # specific query, URL, path, or instruction for this step
 
 class ExecutionPlan(TypedDict):
@@ -166,6 +166,7 @@ Available actions:
 - website_search    — query the web for information
 - read_webpage      — fetch and read a URL (HTML pages, articles)
 - fetch_rss_articles — fetch an RSS/Atom feed and return a compact list of articles; use this instead of read_webpage when the URL is an RSS feed (.xml)
+- call_api          — make an HTTP API request (GET/POST/PUT/PATCH/DELETE) with optional headers, params, and JSON body; ALWAYS use this when making any HTTP API call — never use read_webpage or bash_execute for API calls
 - read_file         — read a local file by path
 - edit_file         — replace an exact string in a local file with new content (targeted edit); use this for modifying existing file contents
 - write_file        — write full content to a local file (overwrites); use only when creating a new file or replacing everything
@@ -182,6 +183,11 @@ URL usage rules:
 - Use website_search ONLY when a URL is not yet known.
 - If a prior step will produce URLs (e.g. a search or feed list), plan subsequent steps as read_webpage and set input_hint to describe which URL to extract from the prior step result (e.g. "use the first article URL from step 1 result").
 - Never search for something that can be read directly from a URL obtained in a prior step.
+
+API usage rules:
+- If the user provides an API key or a known API base URL, ALWAYS plan a call_api step to make the actual request — even if a prior step reads documentation.
+- NEVER use read_webpage, website_search, or bash_execute to call an API or fetch structured data from an endpoint.
+- Reading documentation (read_webpage) and calling the API (call_api) are always separate steps — never combine them into one task.
 
 Be concise. Do not over-plan. Only include steps that are necessary.""")
 
@@ -275,10 +281,11 @@ def agent_execute(state: AgentState) -> AgentState:
             "website_search": "website_search",
             "read_webpage": "read_webpage",
             "fetch_rss_articles": "fetch_rss_articles",
+            "call_api": "call_api",
             "bash_execute": "bash_execute",
         }
         forced_tool = ACTION_TOOL_MAP.get(current["action"])
-        executor = llm.bind_tools(all_tools, tool_choice=forced_tool) if forced_tool else llm.bind_tools(all_tools)
+        executor = llm.bind_tools(all_tools, tool_choice="required") if forced_tool else llm.bind_tools(all_tools)
         guidance_prompt = SystemMessage(content="""You are a task execution agent. Use the available tools to complete the task.
 If prior task results are provided, extract URLs or data from them rather than performing a new search.
 If during execution you discover new work items (e.g. multiple URLs that each need to be read), use add_task to queue them rather than trying to handle everything yourself.""")
@@ -356,6 +363,12 @@ If during execution you discover new work items (e.g. multiple URLs that each ne
                     console.print(f"  [dim]{preview}[/dim]")
                     console.print(f"  [dim]elapsed: {elapsed:.2f}s[/dim]\n")
 
+                elif tool_name == "call_api":
+                    status_line = result.split("\n")[0] if result else "HTTP ?"
+                    tool_tree.add(f"[green]{status_line}[/] — {len(result):,} chars")
+                    console.print(tool_tree)
+                    console.print(f"  [dim]elapsed: {elapsed:.2f}s[/dim]\n")
+
                 elif tool_name == "read_file":
                     tool_tree.add(f"[green]Read {len(result):,} chars[/]")
                     console.print(tool_tree)
@@ -421,9 +434,15 @@ def agent_validate(state: AgentState) -> AgentState:
 
     guidance_prompt = SystemMessage(content="""You are a validation agent. Assess whether a task was completed successfully.
 Return valid=true if the result meaningfully addresses the task description.
-Return valid=false with a reason if the result is empty, an error, irrelevant, or clearly incomplete.""")
+Return valid=false with a reason if the result is empty, an error, irrelevant, or clearly incomplete.
 
-    action_prompt = HumanMessage(content=f"Task: {current['description']}\nResult: {current['result']}")
+Action-specific rules:
+- call_api: valid only if the result starts with "HTTP " and contains a response body. A list of search results or documentation page is NOT a valid result for a call_api task.
+- read_file / edit_file / write_file: valid only if the result confirms file I/O (file contents or a success/error message from the operation).
+- website_search: valid only if the result contains a list of URLs/titles.
+- read_webpage: valid only if the result contains readable page content, not a short error or empty string.""")
+
+    action_prompt = HumanMessage(content=f"Task: {current['description']}\nPlanned action: {current['action']}\nResult: {current['result']}")
 
     status.update(status="Thinking...")
     verdict = validator.invoke([guidance_prompt, action_prompt])

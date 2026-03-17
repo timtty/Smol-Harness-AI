@@ -2,7 +2,6 @@
 
 import argparse
 import sys
-from rich.markdown import Markdown
 
 
 def main():
@@ -34,5 +33,4 @@ def main():
     summarize each python app
     """
 
-    result = agent.invoke({"start_prompt": start_prompt})
-    console.print(Markdown(result["agent_response"]))
+    agent.invoke({"start_prompt": start_prompt})
